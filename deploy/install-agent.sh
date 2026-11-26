@@ -5,9 +5,11 @@
 # 用法（由控制端面板生成，令牌不要回显、不要写进世界可读文件）：
 #   export HISTCONTROL=ignorespace
 #    curl -LfsS --tlsv1.2 -k --pinnedpubkey <证书指纹SPKI> https://<控制端地址>/install-agent.sh \
-#      | bash -s -- --url https://<控制端地址> --pin <证书指纹> --pubkey <证书指纹SPKI> --token <token>
+#      | SBRELAY_TOKEN=<token> bash -s -- --url https://<控制端地址> --pin <证书指纹> --pubkey <证书指纹SPKI>
 #   -k 只跳过系统 CA（自签证书）；真正校验的是 --pinnedpubkey。
-# 卸载：同样下载后追加 --uninstall
+#   令牌走环境变量，不出现在进程参数里。
+# 卸载：--uninstall（保留注册数据）或 --purge（彻底清除，需输入 yes）
+# 已注册机器更新：直接再运行一次，不带参数也行（URL/指纹从 /etc/sbrelay/agent.env 读取）。
 
 set -euo pipefail
 # 禁止 set -x，避免令牌进日志
@@ -17,7 +19,9 @@ usage() {
   cat <<'USAGE'
 用法（root）：
   install-agent.sh --url https://<控制端地址> --pin <证书指纹> --pubkey sha256//<SPKI> [--token <token>]
-  install-agent.sh --uninstall
+  install-agent.sh --update                 已注册机器原地更新（读 /etc/sbrelay/agent.env）
+  install-agent.sh --uninstall              卸载服务，保留注册数据和切换备份
+  install-agent.sh --purge                  卸载并删除注册数据、切换备份（需输入 yes）
 
 环境变量可代替参数：SBRELAY_URL、SBRELAY_TLS_PIN、SBRELAY_PUBKEY、SBRELAY_TOKEN
 已注册过的机器更新时不必再给令牌，不会冲掉 /var/lib/sbrelay-agent 状态。
@@ -30,6 +34,7 @@ PUBKEY="${SBRELAY_PUBKEY:-}"
 TOKEN="${SBRELAY_TOKEN:-}"
 ROLE="${SBRELAY_ROLE:-}"
 UNINSTALL=0
+PURGE=0
 PARSE_ONLY=0
 
 while [ $# -gt 0 ]; do
@@ -40,6 +45,8 @@ while [ $# -gt 0 ]; do
     --token) TOKEN="${2:-}"; shift 2 ;;
     --role) ROLE="${2:-}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
+    --purge) UNINSTALL=1; PURGE=1; shift ;;
+    --update) shift ;;
     --parse-only) PARSE_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数（已忽略细节以免误回显令牌）" >&2; exit 2 ;;
@@ -64,6 +71,7 @@ if [ "$PARSE_ONLY" = 1 ]; then
   printf 'token_set=%s\n' "$tok_set"
   printf 'role=%s\n' "$ROLE"
   printf 'uninstall=%s\n' "$UNINSTALL"
+  printf 'purge=%s\n' "$PURGE"
   exit 0
 fi
 
@@ -77,13 +85,30 @@ uninstall_agent() {
   rm -f /etc/systemd/system/sbrelay-agent.service
   systemctl daemon-reload || true
   rm -f /etc/sudoers.d/sbrelay-helper
-  rm -f /usr/local/lib/sbrelay/sbrelay /usr/local/lib/sbrelay/sbrelay-helper
-  rm -rf /var/lib/sbrelay-agent /etc/sbrelay/agent.env
-  if getent passwd sbrelay >/dev/null; then
-    userdel sbrelay || true
+  # 本机若也装了控制端，保留共用的二进制和 pm
+  if [ ! -f /etc/systemd/system/sbrelay-control.service ]; then
+    rm -f /usr/local/lib/sbrelay/sbrelay /usr/local/lib/sbrelay/sbrelay-helper /usr/local/lib/sbrelay/pm.sh \
+      /usr/local/lib/sbrelay/install-agent.sh /usr/local/bin/pm
+    rmdir /usr/local/lib/sbrelay 2>/dev/null || true
+  fi
+  if [ "$PURGE" = 1 ]; then
+    echo "即将删除本机 agent 注册数据（/var/lib/sbrelay-agent、/etc/sbrelay/agent.env）和切换备份（/var/lib/sbrelay-helper）。"
+    local ans=""
+    read -r -p "确认彻底删除？输入 yes 继续：" ans || true
+    if [ "$ans" = yes ]; then
+      rm -rf /var/lib/sbrelay-agent /var/lib/sbrelay-helper /etc/sbrelay/agent.env
+      rmdir /etc/sbrelay 2>/dev/null || true
+      if getent passwd sbrelay >/dev/null; then
+        userdel sbrelay || true
+      fi
+      echo "已删除 agent 数据。控制端面板里的这台机器可另行删除。"
+    else
+      echo "已取消删除数据；服务已卸载，数据保留。"
+    fi
+  else
+    echo "说明：注册数据（/var/lib/sbrelay-agent、/etc/sbrelay/agent.env）和切换备份（/var/lib/sbrelay-helper）已保留，重新安装时无需新令牌。"
   fi
   echo "AGENT_UNINSTALLED"
-  echo "说明：/var/lib/sbrelay-helper 里的切换备份默认保留，需要时再手动删除。"
   echo "sing-box 配置未被这个卸载脚本改动。"
 }
 
@@ -91,6 +116,15 @@ if [ "$UNINSTALL" = 1 ]; then
   uninstall_agent
   exit 0
 fi
+
+# 更新已注册机器时，缺的参数从 agent.env 补（这些都不是秘密）
+envget() {
+  [ -f /etc/sbrelay/agent.env ] || return 0
+  awk -F= -v k="$1" '$1==k{print substr($0,index($0,"=")+1); exit}' /etc/sbrelay/agent.env
+}
+[ -n "$URL" ] || URL=$(envget SBRELAY_URL)
+[ -n "$PIN" ] || PIN=$(envget SBRELAY_TLS_PIN)
+[ -n "$PUBKEY" ] || PUBKEY=$(envget SBRELAY_PUBKEY)
 
 if [ -z "$URL" ] || [ -z "$PIN" ]; then
   echo "缺少 --url 或 --pin（证书指纹）。请从 Telegram 面板复制完整命令。" >&2
@@ -119,8 +153,24 @@ if [ -s /var/lib/sbrelay-agent/agent.json ]; then
   ALREADY=1
 fi
 if [ "$ALREADY" != 1 ] && [ -z "$TOKEN" ]; then
-  echo "首次安装需要一次性令牌（--token 或 SBRELAY_TOKEN）。" >&2
+  echo "首次安装需要一次性令牌（SBRELAY_TOKEN 环境变量或 --token）。" >&2
   exit 2
+fi
+
+# 只有证书指纹（--pin）时：取对端证书，确认与指纹一致后再算出公钥指纹，供 curl --pinnedpubkey 使用
+if [ -z "$PUBKEY" ]; then
+  hp=${URL#https://}
+  host=${hp%%:*}
+  port=443
+  case "$hp" in *:*) port=${hp##*:} ;; esac
+  certpem=$(timeout 20 openssl s_client -connect "$host:$port" -servername "$host" </dev/null 2>/dev/null | openssl x509 2>/dev/null || true)
+  got=$(printf '%s\n' "$certpem" | openssl x509 -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+  if [ -z "$certpem" ] || [ "$got" != "$PIN" ]; then
+    echo "无法取得控制端证书，或证书指纹不一致，已中止。" >&2
+    exit 2
+  fi
+  PUBKEY="sha256//$(printf '%s\n' "$certpem" | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl enc -base64)"
+  echo "已按证书指纹校验控制端证书，并得到公钥指纹。"
 fi
 
 curl_pin() {
@@ -162,42 +212,42 @@ register_if_needed() {
     echo "检测到已注册状态，执行更新/修复，不重复注册。"
     return 0
   fi
-  python3 - "$URL" "$PIN" "$TOKEN" "$WORKDIR/reg.json" <<'PY'
-import json, ssl, sys, urllib.error, urllib.request, hashlib, socket
-url, pin, token, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-class PinnedHTTPS(urllib.request.HTTPSHandler):
-    def https_open(self, req):
-        return self.do_open(self._cm, req)
-    def _cm(self, host, **kw):
-        ctx = ssl._create_unverified_context()
+  # 令牌经环境变量传给 python，不进进程参数
+  SBRELAY_REG_TOKEN="$TOKEN" python3 - "$URL" "$PIN" "$WORKDIR/reg.json" <<'PY'
+import json, os, ssl, sys, hashlib, http.client, urllib.parse
+url, pin, out = sys.argv[1], sys.argv[2], sys.argv[3]
+token = os.environ.pop("SBRELAY_REG_TOKEN", "")
+u = urllib.parse.urlsplit(url.rstrip("/"))
+
+class PinnedHTTPS(http.client.HTTPSConnection):
+    """只认面板给的证书指纹（证书 DER 的 SHA-256），不依赖系统 CA。"""
+    def connect(self):
+        http.client.HTTPConnection.connect(self)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
-        raw = socket.create_connection((host.split(":")[0], int(host.split(":")[1]) if ":" in host else 443), timeout=20)
-        ss = ctx.wrap_socket(raw, server_hostname=host.split(":")[0])
-        der = ss.getpeercert(True)
-        got = hashlib.sha256(der).hexdigest()
-        if got != pin:
-            ss.close()
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.sock = ctx.wrap_socket(self.sock, server_hostname=self.host)
+        if hashlib.sha256(self.sock.getpeercert(True)).hexdigest() != pin:
+            self.sock.close()
             raise SystemExit("TLS 证书指纹与面板提供的不一致，已拒绝")
-        return ss
-opener = urllib.request.build_opener(PinnedHTTPS())
-req = urllib.request.Request(
-    url.rstrip("/") + "/v1/register",
-    data=json.dumps({"token": token}).encode(),
-    method="POST",
-    headers={"Content-Type": "application/json"},
-)
+
 try:
-    with opener.open(req, timeout=20) as r:
-        body = r.read()
-except urllib.error.HTTPError as e:
-    # 不打印响应正文（可能回显令牌相关信息）
-    if e.code in (401, 403):
-        raise SystemExit("注册令牌无效、已过期或已使用（已拒绝）")
-    raise SystemExit("注册失败，HTTP %s" % e.code)
+    conn = PinnedHTTPS(u.hostname, u.port or 443, timeout=20)
+    conn.request("POST", "/v1/register", body=json.dumps({"token": token}),
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    code, body = resp.status, resp.read()
+    conn.close()
 except SystemExit:
     raise
 except Exception:
     raise SystemExit("注册失败（网络或证书校验）")
+# 不打印响应正文（可能回显令牌相关信息）
+if code in (401, 403):
+    raise SystemExit("注册令牌无效、已过期或已使用（已拒绝）")
+if code != 200:
+    raise SystemExit("注册失败，HTTP %s" % code)
 try:
     data = json.loads(body.decode())
 except Exception:
@@ -232,6 +282,11 @@ id -u sbrelay >/dev/null 2>&1 || useradd --system --home-dir /var/lib/sbrelay-ag
 mkdir -p /usr/local/lib/sbrelay /etc/sbrelay /var/lib/sbrelay-agent /var/lib/sbrelay-helper
 chown sbrelay:sbrelay /var/lib/sbrelay-agent
 chmod 750 /var/lib/sbrelay-agent
+# 保留数据卸载后重装时，用户 uid 可能变化，修正已有注册文件属主
+if [ -f /var/lib/sbrelay-agent/agent.json ]; then
+  chown sbrelay:sbrelay /var/lib/sbrelay-agent/agent.json
+  chmod 600 /var/lib/sbrelay-agent/agent.json
+fi
 chown root:root /var/lib/sbrelay-helper
 chmod 700 /var/lib/sbrelay-helper
 
@@ -248,6 +303,14 @@ fi
 
 install -o root -g sbrelay -m 0750 "$WORKDIR/sbrelay" /usr/local/lib/sbrelay/sbrelay
 install -o root -g sbrelay -m 0750 "$WORKDIR/sbrelay-helper" /usr/local/lib/sbrelay/sbrelay-helper
+# 顺带安装 pm 管理菜单（控制端有就装；失败不影响 agent）
+if curl_pin "$WORKDIR/pm.sh" "$URL/pm.sh" 2>/dev/null && head -n1 "$WORKDIR/pm.sh" | grep -q '^#!/bin/bash'; then
+  install -o root -g root -m 0755 "$WORKDIR/pm.sh" /usr/local/lib/sbrelay/pm.sh
+  ln -sfn /usr/local/lib/sbrelay/pm.sh /usr/local/bin/pm
+fi
+if curl_pin "$WORKDIR/install-agent.sh" "$URL/install-agent.sh" 2>/dev/null && head -n1 "$WORKDIR/install-agent.sh" | grep -q '^#!/bin/bash'; then
+  install -o root -g root -m 0755 "$WORKDIR/install-agent.sh" /usr/local/lib/sbrelay/install-agent.sh
+fi
 
 SUDOERS=/etc/sudoers.d/sbrelay-helper
 if [ "$ROLE" = landing ]; then
@@ -275,9 +338,9 @@ umask 077
 # 更新时保留已有 env 中的 URL/PIN，不写入令牌
 if [ -f /etc/sbrelay/agent.env ]; then
   # 去掉可能残留的令牌行，写回必要字段
-  python3 - "$URL" "$PIN" "$ROLE" <<'PY'
+  python3 - "$URL" "$PIN" "$ROLE" "$PUBKEY" <<'PY'
 import os,sys
-url,pin,role=sys.argv[1:4]
+url,pin,role,pubkey=sys.argv[1:5]
 path="/etc/sbrelay/agent.env"
 vals={}
 if os.path.exists(path):
@@ -292,16 +355,18 @@ if os.path.exists(path):
 vals["SBRELAY_URL"]=url
 vals["SBRELAY_TLS_PIN"]=pin
 vals["SBRELAY_ROLE"]=role
+vals["SBRELAY_PUBKEY"]=pubkey
 vals["SBRELAY_HELPER"]="/usr/local/lib/sbrelay/sbrelay-helper"
 vals["SBRELAY_AGENT_STATE"]="/var/lib/sbrelay-agent"
 with open(path,"w") as f:
-    for k in ("SBRELAY_URL","SBRELAY_TLS_PIN","SBRELAY_ROLE","SBRELAY_HELPER","SBRELAY_AGENT_STATE"):
+    for k in ("SBRELAY_URL","SBRELAY_TLS_PIN","SBRELAY_PUBKEY","SBRELAY_ROLE","SBRELAY_HELPER","SBRELAY_AGENT_STATE"):
         f.write("%s=%s\n"%(k,vals[k]))
 PY
 else
   cat > /etc/sbrelay/agent.env <<ENV
 SBRELAY_URL=${URL}
 SBRELAY_TLS_PIN=${PIN}
+SBRELAY_PUBKEY=${PUBKEY}
 SBRELAY_ROLE=${ROLE}
 SBRELAY_HELPER=/usr/local/lib/sbrelay/sbrelay-helper
 SBRELAY_AGENT_STATE=/var/lib/sbrelay-agent

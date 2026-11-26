@@ -30,8 +30,8 @@ func TestInstallScriptUsesPinAndDoesNotUseBareInsecureCurl(t *testing.T) {
 	if !strings.Contains(s, " curl ") || !strings.Contains(s, "--pinnedpubkey sha256//") {
 		t.Fatalf("expected leading-space curl with pin: %s", s)
 	}
-	if !strings.Contains(s, "--token "+fakeInstallToken) {
-		t.Fatal("token should be passed as flag, not baked into a file path")
+	if !strings.Contains(s, "SBRELAY_TOKEN="+fakeInstallToken+" bash -s --") || strings.Contains(s, "--token "+fakeInstallToken) {
+		t.Fatal("token must be passed via SBRELAY_TOKEN env, not as a process argument")
 	}
 	if strings.Contains(s, "curl -k ") && !strings.Contains(s, "--pinnedpubkey") {
 		t.Fatal("curl -k without pin")
@@ -173,6 +173,14 @@ func TestInstallScriptArgParseAndRoleHints(t *testing.T) {
 	if !strings.Contains(string(out), "uninstall=1") {
 		t.Fatal(string(out))
 	}
+	cmd = exec.Command("bash", script, "--parse-only", "--purge")
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	if !strings.Contains(string(out), "uninstall=1") || !strings.Contains(string(out), "purge=1") {
+		t.Fatal(string(out))
+	}
 }
 
 func TestAddLandingInstallTokenAndReuse(t *testing.T) {
@@ -231,4 +239,26 @@ func findRepoRoot(t *testing.T) string {
 	}
 	t.Fatal("repo root not found")
 	return ""
+}
+
+func TestScriptRoutesServeOnlyKnownScripts(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"pm.sh", "install-control.sh", "state.json"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("#!/bin/bash\necho "+n+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := &Bot{cfg: Config{PkgDir: dir}}
+	for path, want := range map[string]int{"/pm.sh": 200, "/install-control.sh": 200, "/state.json": 404, "/pm.sh/../state.json": 404} {
+		rr := httptest.NewRecorder()
+		b.handleScript(rr, httptest.NewRequest("GET", "https://x"+path, nil))
+		if rr.Code != want {
+			t.Fatalf("%s: got %d want %d", path, rr.Code, want)
+		}
+	}
+	rr := httptest.NewRecorder()
+	b.handleScript(rr, httptest.NewRequest("POST", "https://x/pm.sh", nil))
+	if rr.Code != 405 {
+		t.Fatalf("POST got %d", rr.Code)
+	}
 }

@@ -722,6 +722,8 @@ func (b *Bot) AgentMux() http.Handler {
 	mux.HandleFunc("/install-agent.sh", b.handleInstallAgentSh)
 	mux.HandleFunc("/v1/install-agent.sh", b.handleInstallAgentSh)
 	mux.HandleFunc("/pkg/", b.handlePkg)
+	mux.HandleFunc("/pm.sh", b.handleScript)
+	mux.HandleFunc("/install-control.sh", b.handleScript)
 	return mux
 }
 

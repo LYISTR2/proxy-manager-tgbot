@@ -10,7 +10,7 @@ RELAY_IP=${RELAY_IP:-}
 if [ "$(id -u)" -ne 0 ]; then echo "请用 root 运行" >&2; exit 1; fi
 TOKEN=$(awk -F= '$1=="TOKEN"{print substr($0,index($0,"=")+1)}' "$TOKEN_FILE")
 PASS=$(awk -F= '$1=="PASS"{print substr($0,index($0,"=")+1)}' "$TOKEN_FILE")
-[ -n "$TOKEN" ] && [ -n "$PASS" ] || { echo "token 文件缺字段" >&2; exit 1; }
+if [ -z "$TOKEN" ] || [ -z "$PASS" ]; then echo "token 文件缺字段" >&2; exit 1; fi
 
 BEFORE=$(sha256sum /usr/local/etc/sing-box/config.json | awk '{print $1}')
 UNIT_BEFORE=$(sha256sum /etc/systemd/system/sing-box.service | awk '{print $1}')

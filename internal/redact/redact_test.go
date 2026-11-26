@@ -87,7 +87,7 @@ func TestRedactSSHPasswordAndPrivateKey(t *testing.T) {
 }
 
 func TestRedactLeavesBenignText(t *testing.T) {
-	s := "TLS pin=c0fccda6d1e33c8ab3f4656451cb9563c58574e9172302ef8d6eabcc60050143 listen=:8443 machine_id=91bfc1a2480f3623"
+	s := "TLS pin=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef listen=:8443 machine_id=0000aaaa1111bbbb"
 	if String(s) != s {
 		t.Fatalf("benign text changed: %s", String(s))
 	}

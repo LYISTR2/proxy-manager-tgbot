@@ -26,13 +26,18 @@ import (
 	"sbrelay/internal/tlspin"
 )
 
+// Version 可用 -ldflags "-X main.Version=..." 覆盖。
+var Version = "0.4.0"
+
 func main() {
 	log.SetOutput(redact.Writer(os.Stderr))
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "用法: sbrelay control|agent|gen-cert|issue-token\n")
+		fmt.Fprintf(os.Stderr, "用法: sbrelay control|agent|gen-cert|issue-token|version\n")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "version", "--version", "-v":
+		fmt.Println(Version)
 	case "control":
 		runControl()
 	case "agent":

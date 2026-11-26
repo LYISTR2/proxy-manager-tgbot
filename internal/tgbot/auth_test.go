@@ -172,3 +172,49 @@ func TestAgentAuthHMACAndReplayWindow(t *testing.T) {
 		t.Fatalf("replay nonce should be 401, got %d", code)
 	}
 }
+
+func TestUnboundBotRejectsNonStartCommands(t *testing.T) {
+	b, rt := testBotWithOwner(t, 0)
+	stranger := &User{ID: 3003}
+	chat := &Chat{ID: 3003}
+	b.handleMsg(&Message{ID: 1, Text: "/add 偷渡", Chat: chat, From: stranger})
+	b.handleCB(&CBQ{ID: "cb1", From: stranger, Data: "add", Message: &Message{ID: 2, Chat: chat}})
+	if calls := rt.methods(); len(calls) != 0 {
+		t.Fatalf("unbound bot should not reply to non-/start: %v", calls)
+	}
+	if b.st.Owner() != 0 {
+		t.Fatalf("owner should still be 0, got %d", b.st.Owner())
+	}
+	b.handleMsg(&Message{ID: 3, Text: "/start", Chat: chat, From: stranger})
+	if b.st.Owner() != 3003 {
+		t.Fatalf("expected /start to bind owner 3003, got %d", b.st.Owner())
+	}
+}
+
+func TestHandleResultRejectsOtherMachine(t *testing.T) {
+	b, _ := testBotWithOwner(t, 1001)
+	if err := b.st.With(func(s *store.State) error {
+		s.Machines["m1"] = &store.Machine{ID: "m1", Name: "线路1", Role: store.RoleRelay, Secret: "sec-1", Online: true}
+		s.Machines["m2"] = &store.Machine{ID: "m2", Name: "落地1", Role: store.RoleLanding, Secret: "sec-2", Online: true}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &store.PendingCmd{ID: "cmd-1", Machine: "m1", Op: "status"}
+	if err := b.st.Enqueue(cmd); err != nil {
+		t.Fatal(err)
+	}
+	mux := b.AgentMux()
+	body := []byte(`{"id":"cmd-1","result":{"ok":true}}`)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	req := httptest.NewRequest("POST", "/v1/result", bytes.NewReader(body))
+	req.Header.Set("X-Machine-Id", "m2")
+	req.Header.Set("X-Ts", ts)
+	req.Header.Set("X-Nonce", "n-cross")
+	req.Header.Set("X-Sig", sign("sec-2", ts, "n-cross", string(body)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 400 {
+		t.Fatalf("cross-machine result should be rejected with 400, got %d %s", rec.Code, rec.Body.String())
+	}
+}

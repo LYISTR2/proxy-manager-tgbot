@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"sbrelay/internal/relaycfg"
 	"sbrelay/internal/store"
 )
 
@@ -224,5 +225,119 @@ func TestAddRelayRequiresName(t *testing.T) {
 	reply, _, retry, err := b.applyName(expect{Kind: expectAddRelay}, "新线路")
 	if err != nil || retry || !strings.Contains(reply, "线路机「新线路」安装命令") {
 		t.Fatalf("%v %v %s", retry, err, reply)
+	}
+}
+
+func TestPickTextNilMachineAndBoundLandingFlow(t *testing.T) {
+	b, st, id := testBot(t)
+	// 不存在的机器不应 panic
+	pt, _ := b.pickText("missing-id", 0)
+	if !strings.Contains(pt, "找不到") {
+		t.Fatalf("missing machine: %s", pt)
+	}
+	// 绑定一台落地机并上报 SS2022 信息
+	if err := st.With(func(s *store.State) error {
+		s.Machines["l1"] = &store.Machine{
+			ID:     "l1",
+			Name:   "JP<Tokyo>",
+			Role:   store.RoleLanding,
+			Online: true,
+			LandingNode: &relaycfg.NodeInfo{
+				Tag:      relaycfg.AutoLandingTag,
+				Type:     "shadowsocks",
+				Server:   "198.51.100.10",
+				Port:     34567,
+				Method:   "2022-blake3-aes-128-gcm",
+				Password: "AAAAAAAAAAAAAAAAAAAAAA==",
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	home, _ := b.homeText()
+	if !strings.Contains(home, "JP&lt;Tokyo&gt;") || !strings.Contains(home, "已就绪") {
+		t.Fatalf("home should show escaped bound landing: %s", home)
+	}
+	pt, pkb := b.pickText(id, 0)
+	found := false
+	for _, r := range pkb.InlineKeyboard {
+		for _, btn := range r {
+			if strings.Contains(btn.Text, "JP<Tokyo>") && strings.HasPrefix(btn.Data, "c:") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("pickText should include bound landing machine: %s %+v", pt, pkb)
+	}
+	// 切换失败结果不应覆盖已有的 LastJSON
+	b.ingestStatus(id, json.RawMessage(`{"ok":false,"op":"switch","error":"boom"}`))
+	if parseStatus(st.Machine(id).LastJSON) == nil {
+		t.Fatal("failed switch result overwrote valid status")
+	}
+}
+
+func TestSwitchLandingButtonText(t *testing.T) {
+	if got := switchLandingButtonText(0, 1); got != "换落地" {
+		t.Fatalf("single: %s", got)
+	}
+	if got := switchLandingButtonText(0, 2); got != "给第 1 条中转换落地" {
+		t.Fatalf("first of many: %s", got)
+	}
+	if got := switchLandingButtonText(1, 2); got != "给第 2 条中转换落地" {
+		t.Fatalf("second of many: %s", got)
+	}
+}
+
+func collectBtn(kb *Keyboard, prefix string) []string {
+	var out []string
+	if kb == nil {
+		return out
+	}
+	for _, row := range kb.InlineKeyboard {
+		for _, btn := range row {
+			if strings.HasPrefix(btn.Data, prefix) {
+				out = append(out, btn.Text)
+			}
+		}
+	}
+	return out
+}
+
+func TestMachineTextSwitchButtons(t *testing.T) {
+	b, st, id := testBot(t)
+	_, kb, _ := b.machineText(id)
+	got := collectBtn(kb, "r:"+id+":")
+	if len(got) != 2 || got[0] != "给第 1 条中转换落地" || got[1] != "给第 2 条中转换落地" {
+		t.Fatalf("multi buttons: %v", got)
+	}
+
+	// 只留一条可切换入站
+	if err := st.With(func(s *store.State) error {
+		s.Machines[id].LastJSON = json.RawMessage(`{
+			"ok": true,
+			"status": {
+				"relays": [
+					{"inbound":"sbrelay-ss2022-in","outbound":"relay-out-20001","node_name":"Landing-A"}
+				],
+				"candidates": [
+					{"tag":"relay-out-20001","type":"shadowsocks","label":"shadowsocks"}
+				]
+			}
+		}`)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, kb, _ = b.machineText(id)
+	got = collectBtn(kb, "r:"+id+":")
+	if len(got) != 1 || got[0] != "换落地" {
+		t.Fatalf("single button: %v", got)
+	}
+	for _, t2 := range got {
+		if strings.Contains(t2, "给第") {
+			t.Fatalf("single inbound should not use 给第: %s", t2)
+		}
 	}
 }

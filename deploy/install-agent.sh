@@ -1,6 +1,11 @@
 #!/bin/bash
 # sbrelay agent 一键安装 / 更新 / 修复 / 卸载。
-# 不修改 sing-box 入站、出站或服务启动参数。
+# 线路机：若尚未安装 sing-box，自动安装并搭建 SS2022 节点。
+#         已有真实中转或已有 sbrelay-ss2022-in 则保留不覆盖；
+#         空骨架 relay.json（文件非空但没有 shadowsocks / 可切换入站）会写入 sbrelay-ss2022-in，不整份覆盖。
+# 落地机：若尚未安装 sing-box，自动安装并搭建 SS2022 落地入站并上报给控制端。
+#         已有 config.json 但没有 Shadowsocks 入站时，追加 sbrelay-landing-in，不改已有入站/出站/路由；
+#         已有 SS 入站则沿用（优先 sbrelay-landing-in，否则首个 shadowsocks）。
 #
 # 用法（由控制端面板生成，令牌不要回显、不要写进世界可读文件）：
 #   export HISTCONTROL=ignorespace
@@ -20,10 +25,14 @@ usage() {
 用法（root）：
   install-agent.sh --url https://<控制端地址> --pin <证书指纹> --pubkey sha256//<SPKI> [--token <token>]
   install-agent.sh --update                 已注册机器原地更新（读 /etc/sbrelay/agent.env）
+  install-agent.sh --force-register         忽略已有 agent.json，用新令牌重新注册
+  install-agent.sh --setup-only --role relay|landing
+      只做/补写 sing-box 入站（测试或单独修复用）。目录可用 SBRELAY_SINGBOX_DIR，
+      二进制可用 SBRELAY_SINGBOX_BIN。
   install-agent.sh --uninstall              卸载服务，保留注册数据和切换备份
   install-agent.sh --purge                  卸载并删除注册数据、切换备份（需输入 yes）
 
-环境变量可代替参数：SBRELAY_URL、SBRELAY_TLS_PIN、SBRELAY_PUBKEY、SBRELAY_TOKEN
+环境变量可代替参数：SBRELAY_URL、SBRELAY_TLS_PIN、SBRELAY_PUBKEY、SBRELAY_TOKEN、SBRELAY_SS_PORT、SBRELAY_SS_PASSWORD、SBRELAY_PUBLIC_IP、SBRELAY_SINGBOX_DIR、SBRELAY_SINGBOX_BIN
 已注册过的机器更新时不必再给令牌，不会冲掉 /var/lib/sbrelay-agent 状态。
 USAGE
 }
@@ -36,6 +45,8 @@ ROLE="${SBRELAY_ROLE:-}"
 UNINSTALL=0
 PURGE=0
 PARSE_ONLY=0
+FORCE_REGISTER=0
+SETUP_ONLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,6 +58,8 @@ while [ $# -gt 0 ]; do
     --uninstall) UNINSTALL=1; shift ;;
     --purge) UNINSTALL=1; PURGE=1; shift ;;
     --update) shift ;;
+    --force-register) FORCE_REGISTER=1; shift ;;
+    --setup-only) SETUP_ONLY=1; shift ;;
     --parse-only) PARSE_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数（已忽略细节以免误回显令牌）" >&2; exit 2 ;;
@@ -75,10 +88,345 @@ if [ "$PARSE_ONLY" = 1 ]; then
   exit 0
 fi
 
+# 测试或单独修复时可设：SBRELAY_SINGBOX_DIR、SBRELAY_SINGBOX_BIN、SBRELAY_SS_PORT、SBRELAY_SS_PASSWORD
+SINGBOX_DIR=${SBRELAY_SINGBOX_DIR:-/usr/local/etc/sing-box}
+SINGBOX_BIN=${SBRELAY_SINGBOX_BIN:-/usr/local/bin/sing-box}
+
+pick_free_port() {
+  if [ -n "${SBRELAY_SS_PORT:-}" ]; then
+    echo "$SBRELAY_SS_PORT"
+    return 0
+  fi
+  python3 - <<'PORTPY'
+import random, socket
+for _ in range(50):
+    p = random.randint(20000, 59999)
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        s.bind(("::", p))
+        s.close()
+        print(p)
+        raise SystemExit(0)
+    except OSError:
+        s.close()
+print(random.randint(20000, 59999))
+PORTPY
+}
+
+# 在 conf 目录的 relay.json / config.json 里按角色补写 SS2022 入站。
+# 打印 CREATED/WRITTEN/APPENDED/SKIP_EXISTING（不回显密码）。非 0 表示失败。
+ensure_ss_inbound() {
+  local role="$1" port="$2" password="$3"
+  python3 - "$role" "$SINGBOX_DIR" "$port" "$password" <<'INBPY'
+import json, os, sys
+
+role, conf_dir, port_s, password = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+port = int(port_s)
+
+def load(path):
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+def has_switchable_ss(doc, prefer_tag):
+    for ib in (doc or {}).get("inbounds") or []:
+        if not isinstance(ib, dict):
+            continue
+        if prefer_tag and ib.get("tag") == prefer_tag:
+            return True
+        if ib.get("type") == "shadowsocks":
+            return True
+    return False
+
+def dump(path, doc):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+ss = {
+    "type": "shadowsocks",
+    "tag": "",
+    "listen": "::",
+    "listen_port": port,
+    "method": "2022-blake3-aes-128-gcm",
+    "password": password,
+}
+
+if role == "relay":
+    path = os.path.join(conf_dir, "relay.json")
+    tag = "sbrelay-ss2022-in"
+    ss["tag"] = tag
+    doc = load(path)
+    if doc is not None and has_switchable_ss(doc, tag):
+        print("SKIP_EXISTING")
+        sys.exit(0)
+    created = doc is None
+    if doc is None:
+        doc = {"inbounds": [], "outbounds": [], "route": {"rules": []}}
+    if not isinstance(doc.get("inbounds"), list):
+        doc["inbounds"] = []
+    route = doc.get("route")
+    if not isinstance(route, dict):
+        route = {}
+        doc["route"] = route
+    if not isinstance(route.get("rules"), list):
+        route["rules"] = []
+    doc["inbounds"].append(ss)
+    route["rules"].append({"inbound": tag, "outbound": "direct"})
+    dump(path, doc)
+    print("CREATED" if created else "WRITTEN")
+elif role == "landing":
+    path = os.path.join(conf_dir, "config.json")
+    tag = "sbrelay-landing-in"
+    ss["tag"] = tag
+    doc = load(path)
+    if doc is not None and has_switchable_ss(doc, tag):
+        print("SKIP_EXISTING")
+        sys.exit(0)
+    if doc is None:
+        doc = {
+            "log": {"level": "info", "timestamp": True},
+            "inbounds": [ss],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"},
+        }
+        dump(path, doc)
+        print("CREATED")
+        sys.exit(0)
+    if not isinstance(doc.get("inbounds"), list):
+        doc["inbounds"] = []
+    doc["inbounds"].append(ss)
+    dump(path, doc)
+    print("APPENDED")
+else:
+    sys.exit("未知角色")
+INBPY
+}
+
+setup_singbox_node() {
+  local role="$1"
+  mkdir -p "$SINGBOX_DIR"
+  chmod 755 "$SINGBOX_DIR" 2>/dev/null || true
+  local need_unit=0
+  local need_restart=0
+  local port pass action
+  local bak_dir=""
+
+  rollback_cfg() {
+    if [ -n "$bak_dir" ] && [ -d "$bak_dir" ]; then
+      if [ -f "$bak_dir/relay.json" ] || [ -f "$bak_dir/relay.json.__absent" ]; then
+        if [ -f "$bak_dir/relay.json" ]; then
+          cp -a "$bak_dir/relay.json" "$SINGBOX_DIR/relay.json"
+        else
+          rm -f "$SINGBOX_DIR/relay.json"
+        fi
+      fi
+      if [ -f "$bak_dir/config.json" ] || [ -f "$bak_dir/config.json.__absent" ]; then
+        if [ -f "$bak_dir/config.json" ]; then
+          cp -a "$bak_dir/config.json" "$SINGBOX_DIR/config.json"
+        else
+          rm -f "$SINGBOX_DIR/config.json"
+        fi
+      fi
+      echo "sing-box check 失败，已回滚本次写入的配置。" >&2
+    fi
+  }
+
+  snapshot() {
+    local f=$1
+    if [ -z "$bak_dir" ]; then
+      bak_dir=$(mktemp -d /tmp/sbrelay-cfgbak-XXXXXX)
+    fi
+    if [ -e "$SINGBOX_DIR/$f" ]; then
+      cp -a "$SINGBOX_DIR/$f" "$bak_dir/$f"
+    else
+      : > "$bak_dir/$f.__absent"
+    fi
+  }
+
+  run_check() {
+    if [ "$role" = relay ]; then
+      "$SINGBOX_BIN" check -c "$SINGBOX_DIR/config.json" -c "$SINGBOX_DIR/relay.json"
+    else
+      "$SINGBOX_BIN" check -c "$SINGBOX_DIR/config.json"
+    fi
+  }
+
+  if [ "$role" = relay ]; then
+    if [ ! -s "$SINGBOX_DIR/config.json" ]; then
+      snapshot config.json
+      cat > "$SINGBOX_DIR/config.json" <<'CFG'
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}
+CFG
+      chmod 600 "$SINGBOX_DIR/config.json" 2>/dev/null || true
+      need_restart=1
+    fi
+    snapshot relay.json
+    port=$(pick_free_port)
+    if [ -n "${SBRELAY_SS_PASSWORD:-}" ]; then
+      pass=$SBRELAY_SS_PASSWORD
+    else
+      pass=$(openssl rand -base64 16)
+    fi
+    action=$(ensure_ss_inbound relay "$port" "$pass")
+    unset pass
+    case "$action" in
+      CREATED|WRITTEN)
+        echo "已为线路机写入 SS2022 入站 sbrelay-ss2022-in（端口 ${port}，2022-blake3-aes-128-gcm），节点链接会推送到 Telegram。"
+        need_restart=1
+        if ! run_check; then
+          rollback_cfg
+          rm -rf "$bak_dir"
+          return 1
+        fi
+        ;;
+      SKIP_EXISTING)
+        echo "检测到已有可切换的 Shadowsocks / sbrelay-ss2022-in 入站，已保留原配置。"
+        ;;
+      *)
+        echo "写入线路机入站失败。" >&2
+        rollback_cfg
+        rm -rf "$bak_dir"
+        return 1
+        ;;
+    esac
+    rm -rf "$bak_dir"
+    if [ "$SETUP_ONLY" != 1 ] && [ ! -f /etc/systemd/system/sing-box.service ]; then
+      cat > /etc/systemd/system/sing-box.service <<'SBUNIT'
+[Unit]
+Description=sing-box service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json -c /usr/local/etc/sing-box/relay.json
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+SBUNIT
+      need_unit=1
+      need_restart=1
+    fi
+  else
+    snapshot config.json
+    port=$(pick_free_port)
+    if [ -n "${SBRELAY_SS_PASSWORD:-}" ]; then
+      pass=$SBRELAY_SS_PASSWORD
+    else
+      pass=$(openssl rand -base64 16)
+    fi
+    action=$(ensure_ss_inbound landing "$port" "$pass")
+    unset pass
+    case "$action" in
+      CREATED)
+        echo "已自动为落地机生成 SS2022 落地服务 sbrelay-landing-in（端口 ${port}，2022-blake3-aes-128-gcm）。"
+        need_restart=1
+        if ! run_check; then
+          rollback_cfg
+          rm -rf "$bak_dir"
+          return 1
+        fi
+        ;;
+      APPENDED)
+        echo "已有配置无 Shadowsocks 入站，已追加 sbrelay-landing-in（端口 ${port}），未改动已有入站/出站/路由。"
+        need_restart=1
+        if ! run_check; then
+          rollback_cfg
+          rm -rf "$bak_dir"
+          return 1
+        fi
+        ;;
+      SKIP_EXISTING)
+        echo "检测到已有 Shadowsocks 入站（优先 sbrelay-landing-in，否则沿用首个 shadowsocks），已保留原配置。"
+        ;;
+      *)
+        echo "写入落地机入站失败。" >&2
+        rollback_cfg
+        rm -rf "$bak_dir"
+        return 1
+        ;;
+    esac
+    rm -rf "$bak_dir"
+    if [ "$SETUP_ONLY" != 1 ] && [ ! -f /etc/systemd/system/sing-box.service ]; then
+      cat > /etc/systemd/system/sing-box.service <<'SBUNIT'
+[Unit]
+Description=sing-box service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+SBUNIT
+      need_unit=1
+      need_restart=1
+    fi
+  fi
+
+  if [ "$SETUP_ONLY" = 1 ]; then
+    return 0
+  fi
+  if [ "$need_unit" = 1 ]; then
+    systemctl daemon-reload
+    systemctl enable sing-box.service >/dev/null 2>&1 || true
+  fi
+  if [ "$need_restart" = 1 ] || ! systemctl is-active --quiet sing-box.service; then
+    systemctl restart sing-box.service
+  fi
+}
+
+if [ "$SETUP_ONLY" = 1 ]; then
+  if [ "$ROLE" != "relay" ] && [ "$ROLE" != "landing" ]; then
+    echo "--setup-only 需要 --role relay 或 landing。" >&2
+    exit 2
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "缺少依赖命令 python3。" >&2
+    exit 1
+  fi
+  setup_singbox_node "$ROLE"
+  exit $?
+fi
+
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "请用 root 运行。" >&2
   exit 1
 fi
+
+for cmd in systemctl curl openssl python3; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "缺少依赖命令 $cmd，请先安装。" >&2
+    exit 1
+  fi
+done
 
 uninstall_agent() {
   systemctl disable --now sbrelay-agent.service 2>/dev/null || true
@@ -96,12 +444,12 @@ uninstall_agent() {
     local ans=""
     read -r -p "确认彻底删除？输入 yes 继续：" ans || true
     if [ "$ans" = yes ]; then
-      rm -rf /var/lib/sbrelay-agent /var/lib/sbrelay-helper /etc/sbrelay/agent.env
+      rm -rf /var/lib/sbrelay-agent /var/lib/sbrelay-helper /etc/sbrelay/agent.env /etc/sbrelay/public_ip
       rmdir /etc/sbrelay 2>/dev/null || true
       if getent passwd sbrelay >/dev/null; then
         userdel sbrelay || true
       fi
-      echo "已删除 agent 数据。控制端面板里的这台机器可另行删除。"
+      echo "已删除 agent 数据。控制端面板里的这台机器也可在面板中点击删除。"
     else
       echo "已取消删除数据；服务已卸载，数据保留。"
     fi
@@ -131,7 +479,7 @@ if [ -z "$URL" ] || [ -z "$PIN" ]; then
   exit 2
 fi
 URL="${URL%/}"
-if ! printf '%s' "$URL" | grep -Eq '^https://[A-Za-z0-9.:_-]+(:[0-9]+)?$'; then
+if ! printf '%s' "$URL" | grep -Eq '^https://(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._-]+)(:[0-9]+)?$'; then
   echo "控制端地址不合法，需要 https://<主机>[:端口]" >&2
   exit 2
 fi
@@ -149,7 +497,7 @@ if [ -n "$ROLE" ] && [ "$ROLE" != "relay" ] && [ "$ROLE" != "landing" ]; then
 fi
 
 ALREADY=0
-if [ -s /var/lib/sbrelay-agent/agent.json ]; then
+if [ "$FORCE_REGISTER" != 1 ] && [ -s /var/lib/sbrelay-agent/agent.json ]; then
   ALREADY=1
 fi
 if [ "$ALREADY" != 1 ] && [ -z "$TOKEN" ]; then
@@ -157,13 +505,26 @@ if [ "$ALREADY" != 1 ] && [ -z "$TOKEN" ]; then
   exit 2
 fi
 
+# 从 URL 提取 host 与 port（兼容 IPv4、域名与 [IPv6]）
+extract_host_port() {
+  python3 - "$1" <<'PY'
+import sys, urllib.parse
+u = urllib.parse.urlsplit(sys.argv[1])
+h = u.hostname or ""
+p = u.port or 443
+print(h)
+print(p)
+PY
+}
+
 # 只有证书指纹（--pin）时：取对端证书，确认与指纹一致后再算出公钥指纹，供 curl --pinnedpubkey 使用
 if [ -z "$PUBKEY" ]; then
-  hp=${URL#https://}
-  host=${hp%%:*}
-  port=443
-  case "$hp" in *:*) port=${hp##*:} ;; esac
-  certpem=$(timeout 20 openssl s_client -connect "$host:$port" -servername "$host" </dev/null 2>/dev/null | openssl x509 2>/dev/null || true)
+  mapfile -t _hp < <(extract_host_port "$URL")
+  host="${_hp[0]:-}"
+  port="${_hp[1]:-443}"
+  conn_host="$host"
+  case "$host" in *:*) conn_host="[$host]" ;; esac
+  certpem=$(timeout 20 openssl s_client -connect "$conn_host:$port" -servername "$host" </dev/null 2>/dev/null | openssl x509 2>/dev/null || true)
   got=$(printf '%s\n' "$certpem" | openssl x509 -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
   if [ -z "$certpem" ] || [ "$got" != "$PIN" ]; then
     echo "无法取得控制端证书，或证书指纹不一致，已中止。" >&2
@@ -191,7 +552,7 @@ trap cleanup EXIT
 echo "正在从控制端下载 agent 二进制（已启用公钥指纹校验）..."
 curl_pin "$WORKDIR/sbrelay" "$URL/pkg/sbrelay"
 curl_pin "$WORKDIR/sbrelay-helper" "$URL/pkg/sbrelay-helper"
-chmod 0750 "$WORKDIR/sbrelay" "$WORKDIR/sbrelay-helper"
+chmod 0755 "$WORKDIR/sbrelay" "$WORKDIR/sbrelay-helper"
 # 简单校验是 ELF
 if ! head -c 4 "$WORKDIR/sbrelay" | grep -q $'\x7fELF'; then
   echo "下载的 sbrelay 不是可执行文件，已中止。" >&2
@@ -201,6 +562,62 @@ if ! head -c 4 "$WORKDIR/sbrelay-helper" | grep -q $'\x7fELF'; then
   echo "下载的 sbrelay-helper 不是可执行文件，已中止。" >&2
   exit 1
 fi
+
+# 自动安装 sing-box（若本机尚未安装）
+ensure_singbox() {
+  if [ -x /usr/local/bin/sing-box ]; then
+    return 0
+  fi
+  echo "本机未安装 sing-box，正在自动下载安装官方稳定版..."
+  local arch sb_arch ver url tgz
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64|amd64) sb_arch=amd64 ;;
+    aarch64|arm64) sb_arch=arm64 ;;
+    *) echo "不支持的 CPU 架构：$arch，请手动安装 /usr/local/bin/sing-box。" >&2; return 1 ;;
+  esac
+  ver=${SBRELAY_SINGBOX_VERSION:-}
+  if [ -z "$ver" ]; then
+    ver=$(curl -fsSL --max-time 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))' 2>/dev/null || true)
+  fi
+  ver=${ver:-1.11.4}
+  url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${sb_arch}.tar.gz"
+  tgz="$WORKDIR/sing-box.tar.gz"
+  curl -fL --connect-timeout 20 --max-time 180 "$url" -o "$tgz"
+  tar -xzf "$tgz" -C "$WORKDIR"
+  local bin
+  bin=$(find "$WORKDIR" -maxdepth 2 -type f -name sing-box | head -n1)
+  if [ -z "$bin" ]; then
+    echo "解压 sing-box 失败。" >&2
+    return 1
+  fi
+  install -o root -g root -m 0755 "$bin" /usr/local/bin/sing-box
+  echo "已安装 sing-box：$(/usr/local/bin/sing-box version | head -n1)"
+}
+
+detect_public_ip() {
+  local ip="${SBRELAY_PUBLIC_IP:-}"
+  if [ -z "$ip" ] && [ -s /etc/sbrelay/public_ip ]; then
+    ip=$(tr -d '[:space:]' < /etc/sbrelay/public_ip)
+  fi
+  if [ -z "$ip" ]; then
+    for u in https://api.ipify.org https://ifconfig.me/ip https://ipv4.icanhazip.com; do
+      ip=$(curl -fsS --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]' || true)
+      if printf '%s' "$ip" | grep -Eq '^[0-9A-Fa-f.:]{3,64}$'; then
+        break
+      fi
+      ip=""
+    done
+  fi
+  if [ -z "$ip" ]; then
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  fi
+  printf '%s' "$ip"
+}
+
+# 先确保 sing-box 二进制可用，再向控制端消耗一次性令牌注册（避免环境安装失败白白消耗令牌）
+ensure_singbox
 
 # 若尚未注册，先用令牌向控制端注册，以拿到角色（只读落地 / 可切换线路）
 register_if_needed() {
@@ -265,19 +682,6 @@ if [ "$ROLE" != "relay" ] && [ "$ROLE" != "landing" ]; then
   ROLE=relay
 fi
 
-if [ "$ROLE" = relay ]; then
-  if [ ! -x /usr/local/bin/sing-box ] || [ ! -d /usr/local/etc/sing-box ]; then
-    echo "这是一台光机：还没安装 sing-box / singbox-lite。" >&2
-    echo "请先用官方脚本安装并导入落地 Token，再重新运行本安装脚本。" >&2
-    exit 2
-  fi
-  if [ ! -f /usr/local/etc/sing-box/relay.json ]; then
-    echo "已安装 sing-box，但没有 relay.json。请先用 singbox-lite 做一次中转初始化（不必已有中转）。" >&2
-    exit 2
-  fi
-  echo "检测到已安装的 sing-box / singbox-lite，只安装或更新非 root agent 与 helper，不改动其配置和启动参数。"
-fi
-
 id -u sbrelay >/dev/null 2>&1 || useradd --system --home-dir /var/lib/sbrelay-agent --shell /usr/sbin/nologin --create-home sbrelay
 mkdir -p /usr/local/lib/sbrelay /etc/sbrelay /var/lib/sbrelay-agent /var/lib/sbrelay-helper
 chown sbrelay:sbrelay /var/lib/sbrelay-agent
@@ -289,8 +693,10 @@ if [ -f /var/lib/sbrelay-agent/agent.json ]; then
 fi
 chown root:root /var/lib/sbrelay-helper
 chmod 700 /var/lib/sbrelay-helper
+chown root:root /etc/sbrelay
+chmod 755 /etc/sbrelay
 
-# 已有 agent.json 不覆盖
+# 立刻保存注册凭据，避免后续步骤异常导致令牌浪费
 if [ "$ALREADY" != 1 ] && [ -s "$WORKDIR/reg.json" ]; then
   python3 - "$WORKDIR/reg.json" /var/lib/sbrelay-agent/agent.json <<'PY'
 import json,sys
@@ -301,8 +707,19 @@ PY
   chmod 600 /var/lib/sbrelay-agent/agent.json
 fi
 
-install -o root -g sbrelay -m 0750 "$WORKDIR/sbrelay" /usr/local/lib/sbrelay/sbrelay
-install -o root -g sbrelay -m 0750 "$WORKDIR/sbrelay-helper" /usr/local/lib/sbrelay/sbrelay-helper
+# 记录公网 IP（供 helper 上报 SS2022 节点地址）
+PUB_IP=$(detect_public_ip)
+if [ -n "$PUB_IP" ]; then
+  printf '%s\n' "$PUB_IP" > /etc/sbrelay/public_ip
+  chmod 644 /etc/sbrelay/public_ip
+fi
+
+# 按角色自动初始化 SS2022 节点（已有配置不覆盖）
+setup_singbox_node "$ROLE"
+
+# 二进制设为 root:root 0755，确保同机同时运行控制端(sbrelayctl)与 agent(sbrelay)互不冲突
+install -o root -g root -m 0755 "$WORKDIR/sbrelay" /usr/local/lib/sbrelay/sbrelay
+install -o root -g root -m 0755 "$WORKDIR/sbrelay-helper" /usr/local/lib/sbrelay/sbrelay-helper
 # 顺带安装 pm 管理菜单（控制端有就装；失败不影响 agent）
 if curl_pin "$WORKDIR/pm.sh" "$URL/pm.sh" 2>/dev/null && head -n1 "$WORKDIR/pm.sh" | grep -q '^#!/bin/bash'; then
   install -o root -g root -m 0755 "$WORKDIR/pm.sh" /usr/local/lib/sbrelay/pm.sh
@@ -374,7 +791,6 @@ ENV
 fi
 chown root:sbrelay /etc/sbrelay/agent.env
 chmod 640 /etc/sbrelay/agent.env
-chmod 750 /etc/sbrelay
 
 cat > "$WORKDIR/sbrelay-agent.service" <<'UNIT'
 [Unit]
@@ -402,7 +818,7 @@ systemctl restart sbrelay-agent.service
 sleep 2
 if systemctl is-active --quiet sbrelay-agent.service; then
   echo "AGENT_INSTALLED"
-  echo "服务已启动（角色：$ROLE）。更新不会冲掉已有注册状态。"
+  echo "服务已启动（角色：$ROLE）。请回到 Telegram 面板查看节点信息与切换落地。"
 else
   echo "AGENT_STARTED_CHECK_LOGS"
   echo "服务未能保持运行。请在本机查看：journalctl -u sbrelay-agent -n 50（日志已打码，请勿把完整日志转发到不安全的地方）。"

@@ -1,4 +1,4 @@
-// Package relaycfg 只做纯函数：解析 singbox-lite 的 relay.json / relay_links.json，计算切换后的内容。
+// Package relaycfg 只做纯函数：解析 sing-box 的 relay.json / relay_links.json / config.json，计算切换后的内容。
 // 不碰文件系统，便于单测；落盘、加锁、check、重启都在 helper 里。
 package relaycfg
 
@@ -13,7 +13,11 @@ import (
 	"sbrelay/internal/ojson"
 )
 
-const OutPrefix = "relay-out-"
+const (
+	OutPrefix      = "relay-out-"
+	AutoRelayInTag = "sbrelay-ss2022-in"
+	AutoLandingTag = "sbrelay-landing-in"
+)
 
 // TagRe 限制 tag 字符集：tag 来自 TG 回调，必须防止注入奇怪字符进日志/配置。
 var TagRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
@@ -44,11 +48,33 @@ type Candidate struct {
 	UsedBy []string `json:"used_by,omitempty"`
 }
 
+// NodeInfo 表示自动搭建或本机已有的 SS2022/Shadowsocks 入站节点信息（用于线路机展示节点链接、落地机上报出站凭据）。
+type NodeInfo struct {
+	Tag      string `json:"tag"`
+	Type     string `json:"type"`
+	Server   string `json:"server,omitempty"`
+	Port     int64  `json:"port"`
+	Method   string `json:"method,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
+// OutboundSpec 用于控制端下发已绑定落地机的出站配置，由 helper 写入 relay.json 的 outbounds。
+type OutboundSpec struct {
+	Tag      string `json:"tag"`
+	Type     string `json:"type"`
+	Server   string `json:"server"`
+	Port     int64  `json:"server_port"`
+	Method   string `json:"method,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
 type Status struct {
-	Relays     []Relay     `json:"relays"`
-	Candidates []Candidate `json:"candidates"`
-	XrayRelays []string    `json:"xray_relays,omitempty"`
-	Warnings   []string    `json:"warnings,omitempty"`
+	Relays      []Relay     `json:"relays"`
+	Candidates  []Candidate `json:"candidates"`
+	XrayRelays  []string    `json:"xray_relays,omitempty"`
+	Warnings    []string    `json:"warnings,omitempty"`
+	RelayNode   *NodeInfo   `json:"relay_node,omitempty"`
+	LandingNode *NodeInfo   `json:"landing_node,omitempty"`
 }
 
 func parseObj(b []byte, what string) (*ojson.Object, error) {
@@ -90,11 +116,18 @@ func rules(relay *ojson.Object) []*ojson.Object {
 	return objs(rr)
 }
 
-// 脚本的中转规则形如 {"inbound":"<tag>","outbound":"relay-out-<port>"}，inbound 是字符串。
+// 中转规则形如 {"inbound":"<tag>","outbound":"relay-out-<id>"}；
+// 自动创建的线路机入站 sbrelay-ss2022-in 在尚未绑定落地时 outbound 为 "direct"，同样视为可切换中转。
 func isRelayRule(r *ojson.Object) bool {
 	in, ok1 := r.M["inbound"].(string)
 	out, ok2 := r.M["outbound"].(string)
-	return ok1 && ok2 && in != "" && strings.HasPrefix(out, OutPrefix)
+	if !ok1 || !ok2 || in == "" {
+		return false
+	}
+	if strings.HasPrefix(out, OutPrefix) {
+		return true
+	}
+	return in == AutoRelayInTag && out == "direct"
 }
 
 // Label 复刻脚本 dest_label：http 出站开了 TLS 记为 https。
@@ -108,6 +141,44 @@ func Label(o *ojson.Object) string {
 		}
 	}
 	return t
+}
+
+func extractNode(doc *ojson.Object, preferTag string) *NodeInfo {
+	if doc == nil {
+		return nil
+	}
+	inbV, _ := doc.Get("inbounds")
+	var fallback *NodeInfo
+	for _, o := range objs(inbV) {
+		t := o.Str("type")
+		port := o.Int("listen_port")
+		if t == "" || port <= 0 {
+			continue
+		}
+		info := &NodeInfo{
+			Tag:      o.Str("tag"),
+			Type:     t,
+			Port:     port,
+			Method:   o.Str("method"),
+			Password: o.Str("password"),
+		}
+		if preferTag != "" && info.Tag == preferTag {
+			return info
+		}
+		if fallback == nil && t == "shadowsocks" {
+			fallback = info
+		}
+	}
+	return fallback
+}
+
+// ExtractInbound 从 config.json 或 relay.json 中提取指定 tag（或首个 shadowsocks）入站节点信息。
+func ExtractInbound(rawJSON []byte, preferTag string) (*NodeInfo, error) {
+	doc, err := parseObj(rawJSON, "config.json")
+	if err != nil {
+		return nil, err
+	}
+	return extractNode(doc, preferTag), nil
 }
 
 func Parse(relayJSON, linksJSON []byte) (*Status, error) {
@@ -125,6 +196,8 @@ func Parse(relayJSON, linksJSON []byte) (*Status, error) {
 	for _, o := range objs(inbV) {
 		inb[o.Str("tag")] = o
 	}
+	st.RelayNode = extractNode(relay, AutoRelayInTag)
+
 	used := map[string][]string{}
 	seen := map[string]bool{}
 	for _, r := range rules(relay) {
@@ -165,23 +238,110 @@ func Parse(relayJSON, linksJSON []byte) (*Status, error) {
 	return st, nil
 }
 
+// ValidateSpec 校验下发的落地出站配置。
+func ValidateSpec(sp *OutboundSpec) error {
+	if sp == nil {
+		return nil
+	}
+	if !TagRe.MatchString(sp.Tag) || !strings.HasPrefix(sp.Tag, OutPrefix) {
+		return fmt.Errorf("出站 tag 不合法")
+	}
+	if sp.Type != "shadowsocks" {
+		return fmt.Errorf("暂不支持的出站类型 %q", sp.Type)
+	}
+	if sp.Server == "" || len(sp.Server) > 128 || strings.ContainsAny(sp.Server, " \t\r\n/\\") {
+		return fmt.Errorf("落地地址不合法")
+	}
+	if sp.Port < 1 || sp.Port > 65535 {
+		return fmt.Errorf("落地端口不合法")
+	}
+	if sp.Method == "" || sp.Password == "" {
+		return fmt.Errorf("缺少加密方式或密码")
+	}
+	return nil
+}
+
+func specToObj(sp *OutboundSpec) *ojson.Object {
+	o := ojson.NewObject()
+	o.Set("type", sp.Type)
+	o.Set("tag", sp.Tag)
+	o.Set("server", sp.Server)
+	o.Set("server_port", sp.Port)
+	o.Set("method", sp.Method)
+	o.Set("password", sp.Password)
+	return o
+}
+
+func upsertOutbound(relay *ojson.Object, sp *OutboundSpec) *ojson.Object {
+	obj := specToObj(sp)
+	outV, ok := relay.Get("outbounds")
+	arr, _ := outV.([]any)
+	if !ok || arr == nil {
+		arr = []any{}
+	}
+	for i, e := range arr {
+		if o, ok := e.(*ojson.Object); ok && o.Str("tag") == sp.Tag {
+			arr[i] = obj
+			relay.Set("outbounds", arr)
+			return obj
+		}
+	}
+	arr = append(arr, obj)
+	relay.Set("outbounds", arr)
+	return obj
+}
+
 // Switch 把 inbound 对应中转规则的 outbound 改为 target，并同步 relay_links.json 的落地元数据。
 // links 文件不存在时传 nil，返回的 newLinks 也为 nil（不凭空创建脚本的文件）。
 func Switch(relayJSON, linksJSON []byte, inbound, target string) (newRelay, newLinks []byte, from string, err error) {
-	if !TagRe.MatchString(inbound) || !TagRe.MatchString(target) || !strings.HasPrefix(target, OutPrefix) {
+	return SwitchWithSpec(relayJSON, linksJSON, inbound, target, nil)
+}
+
+// SwitchWithSpec 支持在切换前先写入/更新目标落地出站（来自已绑定的落地机），且绝不修改 inbounds。
+// 当 target == "direct" 且 inbound == AutoRelayInTag 时允许切回直连（例如回滚到初始态）。
+func SwitchWithSpec(relayJSON, linksJSON []byte, inbound, target string, spec *OutboundSpec) (newRelay, newLinks []byte, from string, err error) {
+	allowDirect := inbound == AutoRelayInTag && target == "direct"
+	if !TagRe.MatchString(inbound) || !TagRe.MatchString(target) || (!allowDirect && !strings.HasPrefix(target, OutPrefix)) {
 		return nil, nil, "", fmt.Errorf("参数不合法")
+	}
+	if spec != nil {
+		if spec.Tag == "" {
+			spec.Tag = target
+		}
+		if spec.Tag != target {
+			return nil, nil, "", fmt.Errorf("出站 tag 与目标不一致")
+		}
+		if err := ValidateSpec(spec); err != nil {
+			return nil, nil, "", err
+		}
 	}
 	relay, err := parseObj(relayJSON, "relay.json")
 	if err != nil {
 		return nil, nil, "", err
 	}
+
 	var tgt *ojson.Object
-	outV, _ := relay.Get("outbounds")
-	for _, o := range objs(outV) {
-		if o.Str("tag") == target {
-			tgt = o
+	specChanged := false
+	if spec != nil {
+		// 检查旧的同 tag 出站是否内容有变化（例如落地机换了端口/密码）
+		outV, _ := relay.Get("outbounds")
+		for _, o := range objs(outV) {
+			if o.Str("tag") == target {
+				if o.Str("server") != spec.Server || o.Int("server_port") != spec.Port || o.Str("method") != spec.Method || o.Str("password") != spec.Password {
+					specChanged = true
+				}
+			}
+		}
+		tgt = upsertOutbound(relay, spec)
+	} else if !allowDirect {
+		outV, _ := relay.Get("outbounds")
+		for _, o := range objs(outV) {
+			if o.Str("tag") == target {
+				tgt = o
+			}
 		}
 	}
+
 	var hit *ojson.Object
 	any := false
 	for _, r := range rules(relay) {
@@ -199,11 +359,11 @@ func Switch(relayJSON, linksJSON []byte, inbound, target string) (newRelay, newL
 	if !any {
 		return nil, nil, "", ErrNoRelay
 	}
-	if hit == nil || tgt == nil {
+	if hit == nil || (!allowDirect && tgt == nil) {
 		return nil, nil, "", ErrNotFound
 	}
 	from = hit.Str("outbound")
-	if from == target {
+	if from == target && !specChanged {
 		return nil, nil, from, ErrNoop
 	}
 	hit.Set("outbound", target)
@@ -215,9 +375,14 @@ func Switch(relayJSON, linksJSON []byte, inbound, target string) (newRelay, newL
 		}
 		if lv, ok := links.Get(inbound); ok {
 			if lo, ok := lv.(*ojson.Object); ok {
-				// 脚本写法是 "${dest_addr}:${dest_port}"，IPv6 不加括号，这里保持一致。
-				lo.Set("landing_addr", tgt.Str("server")+":"+strconv.FormatInt(tgt.Int("server_port"), 10))
-				lo.Set("landing_type", Label(tgt))
+				if tgt != nil {
+					// 脚本写法是 "${dest_addr}:${dest_port}"，IPv6 不加括号，这里保持一致。
+					lo.Set("landing_addr", tgt.Str("server")+":"+strconv.FormatInt(tgt.Int("server_port"), 10))
+					lo.Set("landing_type", Label(tgt))
+				} else {
+					lo.Set("landing_addr", "")
+					lo.Set("landing_type", "direct")
+				}
 			}
 		}
 		newLinks = ojson.Marshal(links)

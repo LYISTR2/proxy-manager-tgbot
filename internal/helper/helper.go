@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -19,14 +20,17 @@ import (
 	"sbrelay/internal/relaycfg"
 )
 
+const maxBackups = 20
+
 type Env struct {
-	Dir        string // /usr/local/etc/sing-box
-	SingBox    string // /usr/local/bin/sing-box
-	StateDir   string // /var/lib/sbrelay-helper
-	Service    string // sing-box
-	LockWait   time.Duration
-	Systemctl  func(args ...string) error // 便于测试替换
-	SettleWait time.Duration
+	Dir          string // /usr/local/etc/sing-box
+	SingBox      string // /usr/local/bin/sing-box
+	StateDir     string // /var/lib/sbrelay-helper
+	PublicIPFile string // /etc/sbrelay/public_ip（可选，install-agent 写入）
+	Service      string // sing-box
+	LockWait     time.Duration
+	Systemctl    func(args ...string) error // 便于测试替换
+	SettleWait   time.Duration
 }
 
 func (e *Env) relay() string { return filepath.Join(e.Dir, "relay.json") }
@@ -61,8 +65,9 @@ type LastSwitch struct {
 }
 
 type SwitchReq struct {
-	Inbound  string `json:"inbound"`
-	Outbound string `json:"outbound"`
+	Inbound      string                 `json:"inbound"`
+	Outbound     string                 `json:"outbound"`
+	OutboundSpec *relaycfg.OutboundSpec `json:"outbound_spec,omitempty"`
 }
 
 func sum(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
@@ -75,8 +80,26 @@ func readOpt(p string) ([]byte, error) {
 	return b, err
 }
 
+func (e *Env) publicIP() string {
+	p := e.PublicIPFile
+	if p == "" {
+		p = "/etc/sbrelay/public_ip"
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
 func (e *Env) serviceState() string {
-	out, _ := exec.Command("systemctl", "is-active", e.Service).Output()
+	if e.Systemctl != nil {
+		if err := e.Systemctl("is-active", "--quiet", e.Service); err == nil {
+			return "active"
+		}
+		return "inactive"
+	}
+	out, _ := exec.Command("/usr/bin/systemctl", "is-active", e.Service).Output()
 	return strings.TrimSpace(string(out))
 }
 
@@ -92,16 +115,37 @@ func (e *Env) loadLast() *LastSwitch {
 	return &l
 }
 
-func (e *Env) Status() Result {
+func (e *Env) parseCurrentStatus() (*relaycfg.Status, error) {
 	r, err := readOpt(e.relay())
 	if err != nil {
-		return Result{Op: "status", Error: err.Error()}
+		return nil, err
 	}
 	l, err := readOpt(e.links())
 	if err != nil {
-		return Result{Op: "status", Error: err.Error()}
+		return nil, err
 	}
 	st, err := relaycfg.Parse(r, l)
+	if err != nil {
+		return nil, err
+	}
+	ip := e.publicIP()
+	if st.RelayNode != nil && st.RelayNode.Server == "" && ip != "" {
+		st.RelayNode.Server = ip
+	}
+	// 落地机配置在 config.json（包含 sbrelay-landing-in 或首个 shadowsocks 入站）
+	if cfgBytes, cerr := readOpt(e.main()); cerr == nil && len(cfgBytes) > 0 {
+		if ln, lerr := relaycfg.ExtractInbound(cfgBytes, relaycfg.AutoLandingTag); lerr == nil && ln != nil {
+			if ln.Server == "" && ip != "" {
+				ln.Server = ip
+			}
+			st.LandingNode = ln
+		}
+	}
+	return st, nil
+}
+
+func (e *Env) Status() Result {
+	st, err := e.parseCurrentStatus()
 	if err != nil {
 		return Result{Op: "status", Error: err.Error()}
 	}
@@ -131,8 +175,12 @@ func (e *Env) lock() (*os.File, error) {
 	}
 }
 
-// writeAtomic 同目录临时文件 + fsync + rename，与脚本 _make_same_dir_tmp + mv 一致，权限 600。
+// writeAtomic 同目录临时文件 + fsync + rename，尽量保留原文件权限，不存在时默认 0600。
 func writeAtomic(path string, b []byte) error {
+	mode := os.FileMode(0600)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".sbrelay-*.json")
 	if err != nil {
 		return err
@@ -142,7 +190,7 @@ func writeAtomic(path string, b []byte) error {
 		tmp.Close()
 		return err
 	}
-	if err := tmp.Chmod(0600); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -152,6 +200,27 @@ func writeAtomic(path string, b []byte) error {
 	}
 	tmp.Close()
 	return os.Rename(tmp.Name(), path)
+}
+
+func (e *Env) pruneBackups() {
+	root := filepath.Join(e.StateDir, "backups")
+	ents, err := os.ReadDir(root)
+	if err != nil || len(ents) <= maxBackups {
+		return
+	}
+	var names []string
+	for _, ent := range ents {
+		if ent.IsDir() {
+			names = append(names, ent.Name())
+		}
+	}
+	if len(names) <= maxBackups {
+		return
+	}
+	sort.Strings(names)
+	for _, n := range names[:len(names)-maxBackups] {
+		_ = os.RemoveAll(filepath.Join(root, n))
+	}
 }
 
 func (e *Env) backup(r, l []byte) (string, error) {
@@ -169,6 +238,7 @@ func (e *Env) backup(r, l []byte) (string, error) {
 			return "", err
 		}
 	}
+	e.pruneBackups()
 	return d, nil
 }
 
@@ -206,7 +276,7 @@ func (e *Env) switchLocked(req SwitchReq, res Result) Result {
 		res.Error = "读取 relay_links.json 失败: " + err.Error()
 		return res
 	}
-	nr, nl, from, err := relaycfg.Switch(r, l, req.Inbound, req.Outbound)
+	nr, nl, from, err := relaycfg.SwitchWithSpec(r, l, req.Inbound, req.Outbound, req.OutboundSpec)
 	res.From = from
 	if err != nil {
 		res.Error = err.Error()
@@ -245,18 +315,23 @@ func (e *Env) switchLocked(req SwitchReq, res Result) Result {
 	}
 	if nl != nil {
 		if err := writeAtomic(e.links(), nl); err != nil {
-			writeAtomic(e.relay(), r)
+			_ = writeAtomic(e.relay(), r)
 			res.Error = "写入 relay_links.json 失败，已恢复: " + err.Error()
 			return res
 		}
 	}
 	if err := e.restartHealthy(); err != nil {
-		writeAtomic(e.relay(), r)
+		restoreErr := writeAtomic(e.relay(), r)
 		if l != nil {
-			writeAtomic(e.links(), l)
+			if lerr := writeAtomic(e.links(), l); lerr != nil && restoreErr == nil {
+				restoreErr = lerr
+			}
 		}
 		rerr := e.restartHealthy()
 		res.Error = "切换后服务异常，已自动回滚到原配置: " + err.Error()
+		if restoreErr != nil {
+			res.Error += "；恢复文件失败: " + restoreErr.Error()
+		}
 		if rerr != nil {
 			res.Error += "；回滚后重启也失败: " + rerr.Error() + "（备份在 " + bdir + "）"
 		}
@@ -268,8 +343,9 @@ func (e *Env) switchLocked(req SwitchReq, res Result) Result {
 		last.RolledBack = true
 	}
 	lb, _ := json.Marshal(last)
-	os.WriteFile(filepath.Join(e.StateDir, "last.json"), lb, 0600)
-	res.OK, res.Service, res.Last = true, e.serviceState(), &last
+	_ = os.WriteFile(filepath.Join(e.StateDir, "last.json"), lb, 0600)
+	st, _ := e.parseCurrentStatus()
+	res.OK, res.Service, res.Last, res.Status = true, e.serviceState(), &last, st
 	return res
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"sbrelay/internal/redact"
+	"sbrelay/internal/relaycfg"
 )
 
 type Config struct {
@@ -33,24 +35,38 @@ type Config struct {
 }
 
 func (c *Config) client() *http.Client {
-	// 自签证书：关闭系统 CA 校验，在 do() 里用证书指纹 pin 校验。
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}}
-	return &http.Client{Transport: tr, Timeout: 30 * time.Second}
-}
-
-func pinOK(c *Config, resp *http.Response) bool {
-	if c.TLSPin == "" || resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
-		return c.TLSPin == ""
+	// 自签证书：跳过系统 CA，在 TLS 握手阶段用 VerifyPeerCertificate 强制校验指纹，
+	// 确保在发送任何 HTTP 请求头/令牌前即拒绝不匹配的证书。
+	pin := strings.ToLower(strings.TrimSpace(c.TLSPin))
+	tlsCfg := &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if pin == "" {
+				return nil
+			}
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("对端未提供 TLS 证书")
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			if !strings.EqualFold(hex.EncodeToString(sum[:]), pin) {
+				return fmt.Errorf("TLS 证书与 pin 不符，已拒绝")
+			}
+			return nil
+		},
 	}
-	sum := sha256.Sum256(resp.TLS.PeerCertificates[0].Raw)
-	return strings.EqualFold(hex.EncodeToString(sum[:]), c.TLSPin)
+	tr := &http.Transport{TLSClientConfig: tlsCfg}
+	return &http.Client{Transport: tr, Timeout: 30 * time.Second}
 }
 
 func (c *Config) do(cli *http.Client, path string, body []byte) ([]byte, error) {
 	if body == nil {
 		body = []byte("{}")
 	}
-	req, _ := http.NewRequest("POST", strings.TrimRight(c.URL, "/")+path, bytes.NewReader(body))
+	req, err := http.NewRequest("POST", strings.TrimRight(c.URL, "/")+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.Secret != "" {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
@@ -67,9 +83,6 @@ func (c *Config) do(cli *http.Client, path string, body []byte) ([]byte, error) 
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if !pinOK(c, resp) {
-		return nil, fmt.Errorf("TLS 证书与 pin 不符，已拒绝")
-	}
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
@@ -105,7 +118,8 @@ func (c *Config) register(cli *http.Client) error {
 	if c.Token == "" {
 		return fmt.Errorf("没有注册令牌，也没有本地已注册状态")
 	}
-	raw, err := c.do(cli, "/v1/register", []byte(`{"token":"`+c.Token+`"}`))
+	reqBody, _ := json.Marshal(map[string]string{"token": c.Token})
+	raw, err := c.do(cli, "/v1/register", reqBody)
 	if err != nil {
 		return err
 	}
@@ -157,7 +171,11 @@ func Run(c Config) error {
 	}
 	log.Printf("已连上控制端，machine_id=%s", c.ID)
 	type cmd struct {
-		ID, Op, Inbound, Outbound string
+		ID           string                 `json:"id"`
+		Op           string                 `json:"op"`
+		Inbound      string                 `json:"inbound,omitempty"`
+		Outbound     string                 `json:"outbound,omitempty"`
+		OutboundSpec *relaycfg.OutboundSpec `json:"outbound_spec,omitempty"`
 	}
 	for {
 		payload, _ := json.Marshal(map[string]any{"status": json.RawMessage(c.status())})
@@ -178,7 +196,11 @@ func Run(c Config) error {
 			case "status":
 				out, herr = c.helper("status", nil)
 			case "switch":
-				in, _ := json.Marshal(map[string]string{"inbound": cm.Inbound, "outbound": cm.Outbound})
+				req := map[string]any{"inbound": cm.Inbound, "outbound": cm.Outbound}
+				if cm.OutboundSpec != nil {
+					req["outbound_spec"] = cm.OutboundSpec
+				}
+				in, _ := json.Marshal(req)
 				out, herr = c.helper("switch", in)
 			case "rollback":
 				out, herr = c.helper("rollback", nil)

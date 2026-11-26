@@ -70,3 +70,21 @@ func TestPmReusesInstallScripts(t *testing.T) {
 		}
 	}
 }
+
+func TestPmReuseAfterKeepDataUninstall(t *testing.T) {
+	root := findRepoRoot(t)
+	out, err := exec.Command("bash", "-c", `source "$1"; declare -f agent_install`, "x", filepath.Join(root, "deploy", "pm.sh")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	s := string(out)
+	if !strings.Contains(s, `agent.json`) || !strings.Contains(s, `AGENT_ENV`) {
+		t.Fatal("agent_install should key off retained registration files, not only the unit")
+	}
+	if !strings.Contains(s, "本机有保留的 agent 注册数据") {
+		t.Fatal("missing keep-data uninstall prompt")
+	}
+	if strings.Contains(s, "has_agent && [ -s /var/lib/sbrelay-agent/agent.json ]") {
+		t.Fatal("still requires has_agent before offering token-free update")
+	}
+}

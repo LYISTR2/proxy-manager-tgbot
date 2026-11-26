@@ -91,20 +91,29 @@ func landingNameTaken(st *State, machineID, name, exceptTag string) bool {
 
 // SetRelayName 修改线路机显示名，立刻写入内存和 state.json（无需重启控制端）。
 func (s *Store) SetRelayName(id, name string) error {
+	return s.SetMachineName(id, RoleRelay, name)
+}
+
+// SetMachineName 修改线路机或落地机显示名，同角色内不重名。
+func (s *Store) SetMachineName(id string, role Role, name string) error {
 	n, err := NormalizeName(name)
 	if err != nil {
 		return err
 	}
+	kind := "线路机"
+	if role == RoleLanding {
+		kind = "落地机"
+	}
 	return s.With(func(st *State) error {
 		m := st.Machines[id]
-		if m == nil || m.Revoked || m.Role != RoleRelay {
-			return errors.New("找不到这台线路机")
+		if m == nil || m.Revoked || m.Role != role {
+			return errors.New("找不到这台" + kind)
 		}
 		if m.Name == n {
 			return ErrNameUnchanged
 		}
-		if relayNameTaken(st, n, id) {
-			return fmt.Errorf("%w：已有线路机叫「%s」，请换一个名字", ErrNameTaken, n)
+		if machineNameTaken(st, n, role, id) {
+			return fmt.Errorf("%w：已有%s叫「%s」，请换一个名字", ErrNameTaken, kind, n)
 		}
 		m.Name = n
 		return nil
@@ -173,32 +182,39 @@ type LandingHint struct {
 }
 
 // SeedLandingDefaults 只填充还没有显示名的落地，用脚本里的 node_name（如 Landing-A）做默认可改名。
-// 不覆盖用户已改过的名字；默认名冲突时跳过，留给用户在面板里起名。
+// 不覆盖用户已改过的名字；默认名冲突时跳过；没有任何新增时不写盘。
 func (s *Store) SeedLandingDefaults(machineID string, hints []LandingHint) {
-	_ = s.With(func(st *State) error {
-		m := st.Machines[machineID]
-		if m == nil || m.Revoked {
-			return nil
+	if len(hints) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.s.Machines[machineID]
+	if m == nil || m.Revoked {
+		return
+	}
+	mp := s.ensureLandingMap(&s.s, machineID)
+	changed := false
+	for _, h := range hints {
+		if h.Tag == "" {
+			continue
 		}
-		mp := s.ensureLandingMap(st, machineID)
-		for _, h := range hints {
-			if h.Tag == "" {
-				continue
-			}
-			if cur := mp[h.Tag]; cur != "" {
-				continue
-			}
-			n, err := NormalizeName(h.NodeName)
-			if err != nil {
-				continue
-			}
-			if landingNameTaken(st, machineID, n, h.Tag) {
-				continue
-			}
-			mp[h.Tag] = n
+		if cur := mp[h.Tag]; cur != "" {
+			continue
 		}
-		return nil
-	})
+		n, err := NormalizeName(h.NodeName)
+		if err != nil {
+			continue
+		}
+		if landingNameTaken(&s.s, machineID, n, h.Tag) {
+			continue
+		}
+		mp[h.Tag] = n
+		changed = true
+	}
+	if changed {
+		_ = s.save()
+	}
 }
 
 // NewRelayInstallToken 签发线路机一次性安装令牌。

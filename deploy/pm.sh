@@ -105,13 +105,20 @@ self_install() {
 
 # 证书指纹（hex，证书 DER 的 SHA-256）校验通过后，返回 curl 用的公钥指纹 sha256//...
 spki_from_pin() {
-  local url=$1 pin=$2 hp host port certpem got
-  hp=${url#https://}
-  hp=${hp%%/*}
-  host=${hp%%:*}
-  port=443
-  case "$hp" in *:*) port=${hp##*:} ;; esac
-  certpem=$(timeout 20 openssl s_client -connect "$host:$port" -servername "$host" </dev/null 2>/dev/null | openssl x509 2>/dev/null || true)
+  local url=$1 pin=$2 host port conn_host certpem got
+  mapfile -t _hp < <(python3 - "$url" <<'PY'
+import sys, urllib.parse
+u = urllib.parse.urlsplit(sys.argv[1])
+print(u.hostname or "")
+print(u.port or 443)
+PY
+  )
+  host="${_hp[0]:-}"
+  port="${_hp[1]:-443}"
+  [ -n "$host" ] || return 1
+  conn_host="$host"
+  case "$host" in *:*) conn_host="[$host]" ;; esac
+  certpem=$(timeout 20 openssl s_client -connect "$conn_host:$port" -servername "$host" </dev/null 2>/dev/null | openssl x509 2>/dev/null || true)
   [ -n "$certpem" ] || return 1
   got=$(printf '%s\n' "$certpem" | openssl x509 -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
   [ "$got" = "$pin" ] || return 1
@@ -290,11 +297,11 @@ get_agent_script() {
 }
 
 agent_install() {
-  local role="" m line script url pin pk
-  if has_agent && [ -s /var/lib/sbrelay-agent/agent.json ]; then
-    echo "本机 agent 已注册。"
+  local role="" m line script url pin pk force_flag=""
+  if [ -s /var/lib/sbrelay-agent/agent.json ] && [ -s "$AGENT_ENV" ]; then
+    if has_agent; then echo "本机 agent 已注册。"; else echo "本机有保留的 agent 注册数据（之前保留数据卸载过）。"; fi
     echo "  1. 原地更新 / 修复（不需要新令牌，保留注册和 sudoers 白名单）"
-    echo "  2. 用面板新命令重新安装（首次注册用）"
+    echo "  2. 用面板新命令重新注册安装"
     echo "  0. 返回"
     ask "请选择" 1
     case "$REPLY" in
@@ -310,7 +317,7 @@ agent_install() {
         bash "$script" --update --url "$url" --pin "$pin" --pubkey "$pk"
         return
         ;;
-      2) ;;
+      2) force_flag="--force-register" ;;
       *) return 0 ;;
     esac
   fi
@@ -351,7 +358,7 @@ agent_install() {
   fi
   script=$(get_agent_script "$url" "$pk") || { err "下载 install-agent.sh 失败。"; P_TOK=""; return 1; }
   # 令牌只经环境变量交给安装脚本，不出现在进程参数里
-  SBRELAY_TOKEN="$P_TOK" bash "$script" --url "$url" --pin "$pin" --pubkey "$pk" --role "$role"
+  SBRELAY_TOKEN="$P_TOK" bash "$script" $force_flag --url "$url" --pin "$pin" --pubkey "$pk" --role "$role"
   local rc=$?
   P_TOK=""
   return $rc

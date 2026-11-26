@@ -2,6 +2,7 @@
 package store
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"sbrelay/internal/relaycfg"
 )
 
 type Role string
@@ -21,15 +24,17 @@ const (
 )
 
 type Machine struct {
-	ID       string          `json:"id"`
-	Name     string          `json:"name"`
-	Role     Role            `json:"role"`
-	Secret   string          `json:"secret"` // HMAC 密钥，不进 TG 消息
-	Created  time.Time       `json:"created"`
-	LastSeen time.Time       `json:"last_seen,omitempty"`
-	Online   bool            `json:"online"`
-	LastJSON json.RawMessage `json:"last_status,omitempty"`
-	Revoked  bool            `json:"revoked,omitempty"`
+	ID          string             `json:"id"`
+	Name        string             `json:"name"`
+	Role        Role               `json:"role"`
+	Secret      string             `json:"secret"` // HMAC 密钥，不进 TG 消息
+	Created     time.Time          `json:"created"`
+	LastSeen    time.Time          `json:"last_seen,omitempty"`
+	Online      bool               `json:"online"`
+	LastJSON    json.RawMessage    `json:"last_status,omitempty"`
+	RelayNode   *relaycfg.NodeInfo `json:"relay_node,omitempty"`
+	LandingNode *relaycfg.NodeInfo `json:"landing_node,omitempty"`
+	Revoked     bool               `json:"revoked,omitempty"`
 }
 
 type InstallToken struct {
@@ -41,14 +46,16 @@ type InstallToken struct {
 }
 
 type PendingCmd struct {
-	ID       string          `json:"id"`
-	Machine  string          `json:"machine"`
-	Op       string          `json:"op"` // status, switch, rollback
-	Inbound  string          `json:"inbound,omitempty"`
-	Outbound string          `json:"outbound,omitempty"`
-	Created  time.Time       `json:"created"`
-	Done     bool            `json:"done"`
-	Result   json.RawMessage `json:"result,omitempty"`
+	ID           string                 `json:"id"`
+	Machine      string                 `json:"machine"`
+	Op           string                 `json:"op"` // status, switch, rollback
+	Inbound      string                 `json:"inbound,omitempty"`
+	Outbound     string                 `json:"outbound,omitempty"`
+	OutboundSpec *relaycfg.OutboundSpec `json:"outbound_spec,omitempty"`
+	Created      time.Time              `json:"created"`
+	DispatchedAt time.Time              `json:"dispatched_at,omitempty"`
+	Done         bool                   `json:"done"`
+	Result       json.RawMessage        `json:"result,omitempty"`
 }
 
 type State struct {
@@ -60,9 +67,10 @@ type State struct {
 }
 
 type Store struct {
-	path string
-	mu   sync.Mutex
-	s    State
+	path      string
+	mu        sync.Mutex
+	s         State
+	lastFlush time.Time
 }
 
 func Open(dir string) (*Store, error) {
@@ -70,7 +78,12 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	p := filepath.Join(dir, "state.json")
-	st := &Store{path: p, s: State{Machines: map[string]*Machine{}, Tokens: map[string]*InstallToken{}, Commands: map[string]*PendingCmd{}}}
+	st := &Store{path: p, s: State{
+		Machines:     map[string]*Machine{},
+		Tokens:       map[string]*InstallToken{},
+		Commands:     map[string]*PendingCmd{},
+		LandingNames: map[string]map[string]string{},
+	}}
 	b, err := os.ReadFile(p)
 	if err == nil {
 		if err := json.Unmarshal(b, &st.s); err != nil {
@@ -94,7 +107,22 @@ func Open(dir string) (*Store, error) {
 	return st, nil
 }
 
+func (s *Store) pruneLocked(now time.Time) {
+	for id, c := range s.s.Commands {
+		if c == nil || (c.Done && now.Sub(c.Created) > 10*time.Minute) || now.Sub(c.Created) > 30*time.Minute {
+			delete(s.s.Commands, id)
+		}
+	}
+	for k, t := range s.s.Tokens {
+		if t == nil || (t.Used && now.After(t.Expires)) || now.Sub(t.Expires) > 24*time.Hour {
+			delete(s.s.Tokens, k)
+		}
+	}
+}
+
 func (s *Store) save() error {
+	now := time.Now()
+	s.pruneLocked(now)
 	b, err := json.MarshalIndent(s.s, "", "  ")
 	if err != nil {
 		return err
@@ -103,7 +131,11 @@ func (s *Store) save() error {
 	if err := os.WriteFile(tmp, b, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	s.lastFlush = now
+	return nil
 }
 
 func (s *Store) With(fn func(*State) error) error {
@@ -178,24 +210,41 @@ func (s *Store) Enqueue(m *PendingCmd) error {
 	return s.With(func(st *State) error { st.Commands[m.ID] = m; return nil })
 }
 
+// TakeCommands 取出待下发命令；60 秒内已派发过且未完成的命令不重复派发，避免网络抖动导致重复执行。
+// 没有命令派发时不写盘，避免每 3 秒心跳触发全量持久化。
 func (s *Store) TakeCommands(machine string) []*PendingCmd {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
 	var out []*PendingCmd
-	s.With(func(st *State) error {
-		for _, c := range st.Commands {
-			if !c.Done && c.Machine == machine && time.Since(c.Created) < 2*time.Minute {
-				out = append(out, c)
-			}
+	for _, c := range s.s.Commands {
+		if c == nil || c.Done || c.Machine != machine {
+			continue
 		}
-		return nil
-	})
+		if now.Sub(c.Created) >= 2*time.Minute {
+			continue
+		}
+		if !c.DispatchedAt.IsZero() && now.Sub(c.DispatchedAt) < 60*time.Second {
+			continue
+		}
+		c.DispatchedAt = now
+		out = append(out, c)
+	}
+	if len(out) > 0 {
+		_ = s.save()
+	}
 	return out
 }
 
-func (s *Store) Finish(id string, result json.RawMessage) error {
+// Finish 标记命令完成，并校验命令确实归属于上报的 machineID（防止越权提交结果）。
+func (s *Store) Finish(machineID, id string, result json.RawMessage) error {
 	return s.With(func(st *State) error {
 		c := st.Commands[id]
 		if c == nil {
 			return errors.New("未知命令")
+		}
+		if machineID != "" && c.Machine != machineID {
+			return errors.New("无权提交该命令结果")
 		}
 		c.Done = true
 		c.Result = result
@@ -209,12 +258,12 @@ func (s *Store) Command(id string) *PendingCmd {
 	return s.s.Commands[id]
 }
 
-func (s *Store) Relays() []*Machine {
+func (s *Store) machinesByRole(role Role) []*Machine {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*Machine
 	for _, m := range s.s.Machines {
-		if m.Role == RoleRelay && !m.Revoked {
+		if m != nil && m.Role == role && !m.Revoked {
 			out = append(out, m)
 		}
 	}
@@ -227,17 +276,53 @@ func (s *Store) Relays() []*Machine {
 	return out
 }
 
-func (s *Store) Touch(id string, online bool, status json.RawMessage) {
-	s.With(func(st *State) error {
-		if m := st.Machines[id]; m != nil {
-			m.LastSeen = time.Now()
-			m.Online = online
-			if status != nil {
-				m.LastJSON = status
-			}
-		}
-		return nil
-	})
+func (s *Store) Relays() []*Machine {
+	return s.machinesByRole(RoleRelay)
+}
+
+func (s *Store) Landings() []*Machine {
+	return s.machinesByRole(RoleLanding)
+}
+
+func nodeEqual(a, b *relaycfg.NodeInfo) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+// Touch 更新心跳与状态；仅在状态发生变化或距上次写盘超过 15 秒时才落盘，降低高频 IO。
+func (s *Store) Touch(id string, online bool, status json.RawMessage, relayNode, landingNode *relaycfg.NodeInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.s.Machines[id]
+	if m == nil {
+		return
+	}
+	now := time.Now()
+	changed := m.Online != online || m.LastSeen.IsZero()
+	m.LastSeen = now
+	m.Online = online
+	if len(status) > 0 && !bytes.Equal(m.LastJSON, status) {
+		m.LastJSON = append(json.RawMessage(nil), status...)
+		changed = true
+	}
+	if relayNode != nil && !nodeEqual(m.RelayNode, relayNode) {
+		cp := *relayNode
+		m.RelayNode = &cp
+		changed = true
+	}
+	if landingNode != nil && !nodeEqual(m.LandingNode, landingNode) {
+		cp := *landingNode
+		m.LandingNode = &cp
+		changed = true
+	}
+	if changed || now.Sub(s.lastFlush) >= 15*time.Second {
+		_ = s.save()
+	}
 }
 
 func (s *Store) Revoke(id string) error {

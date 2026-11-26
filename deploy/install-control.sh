@@ -19,6 +19,13 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+for cmd in systemctl openssl python3; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "缺少依赖命令 $cmd，请先安装。" >&2
+    exit 1
+  fi
+done
+
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=""
 if [ -f "$SCRIPT_DIR/../go.mod" ]; then
@@ -33,6 +40,14 @@ ENV_FILE=/etc/sbrelay/control.env
 STATE_DIR=/var/lib/sbrelay
 UNIT=/etc/systemd/system/sbrelay-control.service
 
+BUILD_TMP=""
+TMPENV=""
+cleanup() {
+  [ -n "$BUILD_TMP" ] && rm -rf "$BUILD_TMP"
+  [ -n "$TMPENV" ] && rm -f "$TMPENV"
+}
+trap cleanup EXIT
+
 MODE=install
 PURGE=0
 for a in "$@"; do
@@ -46,14 +61,15 @@ for a in "$@"; do
 done
 
 # 只把文件装到目标位置；源和目标是同一个文件时跳过（从已安装位置重跑修复）。
+# 二进制和公开脚本对控制端(sbrelayctl)和同机 agent(sbrelay)共用，设为 root:root 0755 避免同机权限冲突。
 install_file() {
   local mode=$1 src=$2 dst=$3
   if [ -e "$dst" ] && [ "$src" -ef "$dst" ]; then
-    chown root:sbrelayctl "$dst" 2>/dev/null || true
+    chown root:root "$dst" 2>/dev/null || true
     chmod "$mode" "$dst"
     return 0
   fi
-  install -o root -g sbrelayctl -m "$mode" "$src" "$dst"
+  install -o root -g root -m "$mode" "$src" "$dst"
 }
 
 # 从标准输入读一行 Bot token，写进 control.env。不回显、不进命令行参数。
@@ -100,6 +116,7 @@ uninstall_control() {
   # 本机若也装了 agent，保留共用的二进制和 pm
   if [ ! -f /etc/systemd/system/sbrelay-agent.service ]; then
     rm -f "$BIN_DST" "$HELPER_DST" "$LIB_DIR/install-agent.sh" "$LIB_DIR/install-control.sh" "$LIB_DIR/pm.sh" "$PM_LINK"
+    rmdir "$LIB_DIR" 2>/dev/null || true
   fi
   if [ "$PURGE" = 1 ]; then
     echo "即将删除 $STATE_DIR 与 /etc/sbrelay/control.env、证书（含 Bot token，删后无法恢复）。"
@@ -152,10 +169,10 @@ HELPER_SRC=${HELPER_SRC:-}
 if [ -z "$BIN_SRC" ] || [ -z "$HELPER_SRC" ]; then
   if [ -n "$REPO_ROOT" ] && command -v go >/dev/null; then
     echo "在仓库里编译（CGO_ENABLED=0）..."
-    out=$(mktemp -d /tmp/sbrelay-build-XXXXXX)
-    (cd "$REPO_ROOT" && CGO_ENABLED=0 go build -o "$out/sbrelay" ./cmd/sbrelay && CGO_ENABLED=0 go build -o "$out/sbrelay-helper" ./cmd/sbrelay-helper)
-    BIN_SRC=$out/sbrelay
-    HELPER_SRC=$out/sbrelay-helper
+    BUILD_TMP=$(mktemp -d /tmp/sbrelay-build-XXXXXX)
+    (cd "$REPO_ROOT" && CGO_ENABLED=0 go build -o "$BUILD_TMP/sbrelay" ./cmd/sbrelay && CGO_ENABLED=0 go build -o "$BUILD_TMP/sbrelay-helper" ./cmd/sbrelay-helper)
+    BIN_SRC=$BUILD_TMP/sbrelay
+    HELPER_SRC=$BUILD_TMP/sbrelay-helper
   else
     for d in "$SCRIPT_DIR" /tmp/sbrelay-pkg "$LIB_DIR"; do
       if [ -x "$d/sbrelay" ] && [ -x "$d/sbrelay-helper" ]; then
@@ -175,8 +192,8 @@ id -u sbrelayctl >/dev/null 2>&1 || useradd --system --home-dir "$STATE_DIR" --s
 mkdir -p "$LIB_DIR" /etc/sbrelay "$STATE_DIR"
 chown sbrelayctl:sbrelayctl "$STATE_DIR"
 chmod 750 "$STATE_DIR"
-chown root:sbrelayctl /etc/sbrelay
-chmod 750 /etc/sbrelay
+chown root:root /etc/sbrelay
+chmod 755 /etc/sbrelay
 
 env_get() {
   [ -f "$ENV_FILE" ] || return 0
@@ -202,8 +219,12 @@ if [ -z "$HOST" ]; then
   HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
 fi
 HOST=${HOST:-127.0.0.1}
+URL_HOST="$HOST"
+case "$HOST" in
+  *:*) URL_HOST="[$HOST]" ;;
+esac
 PUB=${SBRELAY_PUBLIC_URL:-$(env_get SBRELAY_PUBLIC_URL)}
-PUB=${PUB:-https://${HOST}:${LISTEN##*:}}
+PUB=${PUB:-https://${URL_HOST}:${LISTEN##*:}}
 OWNER=${SBRELAY_OWNER_ID:-$(env_get SBRELAY_OWNER_ID)}
 
 HAVE_TOKEN=0
@@ -216,8 +237,8 @@ fi
 
 echo "正在安装二进制到 $BIN_DST（并链接 $BIN_LINK）..."
 systemctl stop sbrelay-control.service 2>/dev/null || true
-install_file 0750 "$BIN_SRC" "$BIN_DST"
-install_file 0750 "$HELPER_SRC" "$HELPER_DST"
+install_file 0755 "$BIN_SRC" "$BIN_DST"
+install_file 0755 "$HELPER_SRC" "$HELPER_DST"
 # 安装脚本与 pm 一起放进下发目录：控制端会通过 :8443 下发给 agent 机器
 for f in install-agent.sh install-control.sh pm.sh; do
   if [ -f "$SCRIPT_DIR/$f" ]; then
@@ -273,6 +294,7 @@ if [ "$HAVE_TOKEN" = 1 ] && [ "${SBRELAY_OVERWRITE_TOKEN:-}" != 1 ]; then
 fi
 install -o root -g sbrelayctl -m 0640 "$TMPENV" "$ENV_FILE"
 rm -f "$TMPENV"
+TMPENV=""
 if [ "$OLD_TOKEN_LINE" != 1 ]; then
   if [ -n "${SBRELAY_TG_TOKEN:-}" ]; then
     printf '%s\n' "$SBRELAY_TG_TOKEN" | write_token_from_stdin
@@ -328,6 +350,6 @@ echo "数据目录：$STATE_DIR（更新未覆盖已有 state）"
 echo
 echo "下一步："
 echo "  1. 在 Telegram 向 Bot 发送 /start（首位管理员会被绑定）。"
-echo "  2. 面板点「添加线路机 / 添加落地机」，把命令拿到目标机器以 root 执行。"
+echo "  2. 面板点「添加线路机 / 添加落地机」，把命令拿到目标机器以 root 执行（自动搭建 SS2022 节点）。"
 echo "  3. 以后随时运行 pm 打开管理菜单。"
 echo "CONTROL_INSTALLED"

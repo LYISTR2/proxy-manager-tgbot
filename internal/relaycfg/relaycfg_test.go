@@ -120,3 +120,59 @@ func TestSingboxCheck(t *testing.T) {
 		t.Fatalf("sing-box check 失败: %v %s", err, out)
 	}
 }
+
+func TestAutoSS2022RelaySwitchWithSpec(t *testing.T) {
+	initial := []byte(`{
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "sbrelay-ss2022-in",
+      "listen": "::",
+      "listen_port": 31234,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "FAKE-RELAY-SS2022-PASSWORD=="
+    }
+  ],
+  "outbounds": [],
+  "route": {
+    "rules": [
+      {
+        "inbound": "sbrelay-ss2022-in",
+        "outbound": "direct"
+      }
+    ]
+  }
+}`)
+	st, err := Parse(initial, nil)
+	if err != nil || len(st.Relays) != 1 || st.Relays[0].Outbound != "direct" || st.RelayNode == nil || st.RelayNode.Port != 31234 {
+		t.Fatalf("parse auto relay: %v %+v", err, st)
+	}
+	spec := &OutboundSpec{
+		Tag:      "relay-out-land01",
+		Type:     "shadowsocks",
+		Server:   "198.51.100.20",
+		Port:     41234,
+		Method:   "2022-blake3-aes-128-gcm",
+		Password: "FAKE-LANDING-SS2022-KEY==",
+	}
+	nr, nl, from, err := SwitchWithSpec(initial, nil, AutoRelayInTag, "relay-out-land01", spec)
+	if err != nil || nl != nil || from != "direct" {
+		t.Fatalf("switch with spec: %v %q", err, from)
+	}
+	st2, err := Parse(nr, nil)
+	if err != nil || len(st2.Relays) != 1 || st2.Relays[0].Outbound != "relay-out-land01" {
+		t.Fatalf("after switch: %v %+v", err, st2)
+	}
+	if !strings.Contains(string(nr), "FAKE-RELAY-SS2022-PASSWORD==") || !strings.Contains(string(nr), "198.51.100.20") {
+		t.Fatalf("inbound preserved & outbound added check failed: %s", nr)
+	}
+	// 回滚回 direct
+	nr2, _, from2, err := SwitchWithSpec(nr, nil, AutoRelayInTag, "direct", nil)
+	if err != nil || from2 != "relay-out-land01" {
+		t.Fatalf("rollback to direct: %v %q", err, from2)
+	}
+	st3, _ := Parse(nr2, nil)
+	if st3.Relays[0].Outbound != "direct" {
+		t.Fatalf("expected direct, got %+v", st3.Relays[0])
+	}
+}

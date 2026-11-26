@@ -15,13 +15,14 @@ import (
 
 func main() {
 	env := &helper.Env{
-		Dir:        "/usr/local/etc/sing-box",
-		SingBox:    "/usr/local/bin/sing-box",
-		StateDir:   "/var/lib/sbrelay-helper",
-		Service:    "sing-box",
-		LockWait:   30 * time.Second,
-		SettleWait: 3 * time.Second,
-		Systemctl:  func(a ...string) error { return exec.Command("/usr/bin/systemctl", a...).Run() },
+		Dir:          "/usr/local/etc/sing-box",
+		SingBox:      "/usr/local/bin/sing-box",
+		StateDir:     "/var/lib/sbrelay-helper",
+		PublicIPFile: "/etc/sbrelay/public_ip",
+		Service:      "sing-box",
+		LockWait:     30 * time.Second,
+		SettleWait:   3 * time.Second,
+		Systemctl:    func(a ...string) error { return exec.Command("/usr/bin/systemctl", a...).Run() },
 	}
 	os.MkdirAll(env.StateDir, 0700)
 	var res helper.Result
@@ -33,9 +34,11 @@ func main() {
 			res = env.Status()
 		case "switch":
 			var req helper.SwitchReq
-			b, _ := io.ReadAll(io.LimitReader(os.Stdin, 4096))
+			b, _ := io.ReadAll(io.LimitReader(os.Stdin, 8192))
 			if err := json.Unmarshal(b, &req); err != nil || !relaycfg.TagRe.MatchString(req.Inbound) || !relaycfg.TagRe.MatchString(req.Outbound) {
 				res = helper.Result{Op: "switch", Error: "参数不合法"}
+			} else if req.OutboundSpec != nil && relaycfg.ValidateSpec(req.OutboundSpec) != nil {
+				res = helper.Result{Op: "switch", Error: "落地出站参数不合法"}
 			} else {
 				res = env.Switch(req, "switch")
 			}

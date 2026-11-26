@@ -1,0 +1,73 @@
+{
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-in-20001",
+      "listen": "::",
+      "listen_port": 20001,
+      "method": "aes-128-gcm",
+      "password": "FAKE-relay-in-20001-password"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-in-20002",
+      "listen": "::",
+      "listen_port": 20002,
+      "method": "aes-128-gcm",
+      "password": "FAKE-relay-in-20002-password"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "relay-out-20002",
+      "server": "203.0.113.20",
+      "server_port": 443,
+      "method": "aes-128-gcm",
+      "password": "FAKE-landing-b"
+    },
+    {
+      "type": "vless",
+      "tag": "relay-out-20001",
+      "server": "203.0.113.10",
+      "server_port": 8443,
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0",
+          "short_id": "0123abcd"
+        }
+      }
+    },
+    {
+      "type": "http",
+      "tag": "relay-out-20003",
+      "server": "2001:db8::30",
+      "server_port": 8080,
+      "tls": {
+        "enabled": true,
+        "server_name": "proxy.example.com"
+      }
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": "shadowsocks-in-20001",
+        "outbound": "relay-out-20001"
+      },
+      {
+        "inbound": "shadowsocks-in-20002",
+        "outbound": "relay-out-20002"
+      }
+    ]
+  }
+}

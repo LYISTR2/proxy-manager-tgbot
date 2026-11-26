@@ -1,0 +1,16 @@
+# 凭据与运行态绝不入库
+*.env
+.env*
+secrets.env
+state.json
+*.tar.gz
+*.pem
+*.key
+id_*
+*.pub
+dist/
+bin/
+*-data/
+/sbrelay
+/sbrelay-helper
+/tmp/

@@ -1,0 +1,18 @@
+[Unit]
+Description=sbrelay Telegram control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sbrelayctl
+Group=sbrelayctl
+EnvironmentFile=/etc/sbrelay/control.env
+ExecStart=/usr/local/lib/sbrelay/sbrelay control
+WorkingDirectory=/var/lib/sbrelay
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

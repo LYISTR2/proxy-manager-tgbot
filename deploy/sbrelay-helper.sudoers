@@ -1,0 +1,5 @@
+# sbrelay-helper：只放行三个固定子命令，参数写死在二进制里。
+# 切换细节走 stdin JSON，避免 sudoers 通配符。
+sbrelay ALL=(root) NOPASSWD: /usr/local/lib/sbrelay/sbrelay-helper status
+sbrelay ALL=(root) NOPASSWD: /usr/local/lib/sbrelay/sbrelay-helper switch
+sbrelay ALL=(root) NOPASSWD: /usr/local/lib/sbrelay/sbrelay-helper rollback

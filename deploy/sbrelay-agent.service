@@ -1,0 +1,17 @@
+[Unit]
+Description=sbrelay line-agent (connects out to control plane)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sbrelay
+Group=sbrelay
+EnvironmentFile=/etc/sbrelay/agent.env
+ExecStart=/usr/local/lib/sbrelay/sbrelay agent
+WorkingDirectory=/var/lib/sbrelay-agent
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target

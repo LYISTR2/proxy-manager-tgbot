@@ -48,6 +48,8 @@ fi
 
 install -o root -g root -m 0755 "${TMP}/${ASSET}" "$BIN"
 ln -sfn "$BIN" /usr/local/bin/pm
+rm -rf -- "$TMP"
+trap - EXIT
 
 case "${1:-}" in
   control) shift; exec "$BIN" setup control "$@" ;;

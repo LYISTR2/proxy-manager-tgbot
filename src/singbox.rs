@@ -128,7 +128,8 @@ impl SingboxManager<SystemdRunner> {
 }
 
 impl<R: ServiceRunner> SingboxManager<R> {
-    /// 初始化单文件 sing-box config.json；若已有有效 shadowsocks 入站则保留其端口与密码。
+    /// 初始化 sbrelay 专用 sing-box 配置；若已存在含 `sbrelay-in` 的配置则原样保留，
+    /// 若文件非空但不含 `sbrelay-in` 则中止，绝不覆盖或劫持外部配置。
     pub fn init_node(
         &self,
         port_override: Option<u16>,
@@ -136,13 +137,23 @@ impl<R: ServiceRunner> SingboxManager<R> {
     ) -> Result<(NodeInfo, bool)> {
         if self.config_path.exists() {
             let raw = fs::read_to_string(&self.config_path)?;
-            if let Ok(doc) = serde_json::from_str::<Value>(&raw) {
+            if !raw.trim().is_empty() {
+                let doc: Value = serde_json::from_str(&raw).with_context(|| {
+                    format!(
+                        "已有配置 {} 无法解析为 JSON，拒绝覆盖",
+                        self.config_path.display()
+                    )
+                })?;
                 if let Some(mut existing) = extract_inbound(&doc) {
                     if existing.server.is_empty() {
                         existing.server = self.public_ip.clone().unwrap_or_default();
                     }
                     return Ok((existing, false));
                 }
+                bail!(
+                    "检测到已有配置 {} 但不含 sbrelay 管理的入站 ({INBOUND_TAG})，已中止以避免覆盖原有配置",
+                    self.config_path.display()
+                );
             }
         }
 
@@ -385,8 +396,10 @@ impl<R: ServiceRunner> SingboxManager<R> {
 
 fn extract_inbound(doc: &Value) -> Option<NodeInfo> {
     let inbounds = doc.get("inbounds")?.as_array()?;
-    let mut fallback = None;
     for ib in inbounds {
+        if ib.get("tag").and_then(Value::as_str) != Some(INBOUND_TAG) {
+            continue;
+        }
         let ty = ib.get("type").and_then(Value::as_str).unwrap_or("");
         let port = ib
             .get("listen_port")
@@ -396,7 +409,7 @@ fn extract_inbound(doc: &Value) -> Option<NodeInfo> {
         if ty != "shadowsocks" || port == 0 {
             continue;
         }
-        let info = NodeInfo {
+        return Some(NodeInfo {
             server: String::new(),
             port,
             method: ib
@@ -409,15 +422,9 @@ fn extract_inbound(doc: &Value) -> Option<NodeInfo> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-        };
-        if ib.get("tag").and_then(Value::as_str) == Some(INBOUND_TAG) {
-            return Some(info);
-        }
-        if fallback.is_none() {
-            fallback = Some(info);
-        }
+        });
     }
-    fallback
+    None
 }
 
 fn extract_egress(doc: &Value) -> Egress {
@@ -680,5 +687,23 @@ mod tests {
         let r_rst = m.switch(EgressTarget::Landing { spec }, "switch");
         assert!(!r_rst.ok);
         assert_eq!(fs::read(&m.config_path).unwrap(), before);
+    }
+
+    #[test]
+    fn refuses_foreign_config_without_sbrelay_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mgr(dir.path(), Role::Relay, MockRunner::ok());
+
+        // 已有其他 shadowsocks 入站（tag 不是 sbrelay-in）：绝不劫持也不覆盖
+        let foreign = br#"{"inbounds":[{"type":"shadowsocks","tag":"user-ss","listen_port":8888,"method":"2022-blake3-aes-128-gcm","password":"abc"}]}"#;
+        fs::write(&m.config_path, foreign).unwrap();
+        assert!(m.init_node(Some(23456), Some("newpass".into())).is_err());
+        assert_eq!(fs::read(&m.config_path).unwrap(), foreign);
+
+        // 已有其他协议配置（如 vless）：绝不覆盖
+        let foreign_vless = br#"{"inbounds":[{"type":"vless","tag":"vless-in","listen_port":443}]}"#;
+        fs::write(&m.config_path, foreign_vless).unwrap();
+        assert!(m.init_node(Some(23456), Some("newpass".into())).is_err());
+        assert_eq!(fs::read(&m.config_path).unwrap(), foreign_vless);
     }
 }

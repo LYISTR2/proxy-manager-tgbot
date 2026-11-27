@@ -36,8 +36,12 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/sbrelay-dl-XXXXXX")"
 trap 'rm -rf -- "$TMP"' EXIT
 
 echo "正在下载 ${ASSET}（${REPO}@${VERSION}）..."
-curl -fL --proto '=https' --connect-timeout 15 --max-time 180 "${BASE}/${ASSET}" -o "${TMP}/${ASSET}"
-curl -fsSL --proto '=https' --connect-timeout 15 --max-time 60 "${BASE}/SHA256SUMS" -o "${TMP}/SHA256SUMS"
+if ! curl -fL --proto '=https' --connect-timeout 15 --max-time 180 "${BASE}/${ASSET}" -o "${TMP}/${ASSET}"; then
+  die "下载 ${ASSET} 失败（${BASE}/${ASSET}）。请检查 Release 版本是否存在、网络是否可访问 GitHub，或设置 SBRELAY_MIRROR 镜像前缀后重试。"
+fi
+if ! curl -fsSL --proto '=https' --connect-timeout 15 --max-time 60 "${BASE}/SHA256SUMS" -o "${TMP}/SHA256SUMS"; then
+  die "下载 SHA256SUMS 失败（${BASE}/SHA256SUMS），无法校验二进制完整性，已中止安装。"
+fi
 
 (cd "$TMP" && grep "  ${ASSET}\$" SHA256SUMS | sha256sum -c --status -) \
   || die "SHA-256 校验失败，已中止安装。"

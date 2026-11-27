@@ -52,6 +52,10 @@ impl ControlState {
         map.entry(ip.to_string()).or_default().push(now);
     }
 
+    fn clear_register_fails(&self, ip: &str) {
+        self.reg_fails.lock().unwrap().remove(ip);
+    }
+
     fn accept_nonce(&self, machine_id: &str, ts: i64, nonce: &str, now: i64) -> bool {
         if machine_id.is_empty() || nonce.is_empty() {
             return false;
@@ -150,6 +154,7 @@ async fn handle_register(
             return Err((StatusCode::FORBIDDEN, e.to_string()));
         }
     };
+    state.clear_register_fails(&ip);
     Ok(Json(RegisterResponse {
         machine_id: m.id,
         secret: m.secret,
@@ -331,7 +336,29 @@ mod tests {
         assert_eq!(rresp.status(), StatusCode::OK);
         assert!(rx.await.unwrap().ok);
 
-        // 5. 注册失败限流（5 次后返回 429）
+        // 5. 先失败 3 次再成功注册 1 次，失败计数应清零；随后再失败 5 次才触发 429
+        for _ in 0..3 {
+            let r = cli
+                .post(format!("{base}/v1/register"))
+                .json(&RegisterRequest {
+                    token: "wrong".into(),
+                })
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        }
+        let tok2 = store
+            .new_install_token("测试落地", Role::Landing, Duration::from_secs(300))
+            .unwrap();
+        let ok_reg = cli
+            .post(format!("{base}/v1/register"))
+            .json(&RegisterRequest { token: tok2.token })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_reg.status(), StatusCode::OK);
+
         for _ in 0..REG_FAIL_LIMIT {
             let r = cli
                 .post(format!("{base}/v1/register"))

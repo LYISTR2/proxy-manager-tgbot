@@ -53,5 +53,6 @@ cargo build --release
 
 - **TLS 证书指纹固定（DER SHA-256）**：Agent 在 TLS 握手阶段强校验控制端自签证书指纹，不匹配即拒绝连接。
 - **防重放鉴权**：所有 Agent 请求均带 `HMAC-SHA256` 签名、±120 秒时间窗与 Nonce 防重放；注册接口带单 IP 失败限流，安装令牌一次性且 2 小时过期。
+- **独立 `sing-box` 实例隔离**：sbrelay 使用专用配置 `/etc/sbrelay/sing-box.json` 与独立服务 `sbrelay-sing-box.service`，完全不修改或覆盖宿主机原有的 `sing-box.service` 及任何单/多文件配置。
 - **配置零损坏保障**：切换只改出站与 `route.final`，绝不修改入站；每次切换前自动备份并执行 `sing-box check`，失败不落盘，重启异常自动恢复并支持一键回滚。
 - **最小权限与脱敏**：配置文件与密钥权限 `0600`；systemd 启用 `ProtectSystem=strict` 与路径白名单；日志自动脱敏 Bot token 与密码。

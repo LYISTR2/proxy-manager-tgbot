@@ -78,6 +78,8 @@ struct State {
     #[serde(default)]
     owner_id: i64,
     #[serde(default)]
+    tg_offset: i64,
+    #[serde(default)]
     machines: HashMap<String, Machine>,
     #[serde(default)]
     tokens: HashMap<String, InstallToken>,
@@ -166,6 +168,18 @@ impl Store {
 
     pub fn owner(&self) -> i64 {
         self.inner.lock().unwrap().state.owner_id
+    }
+
+    pub fn tg_offset(&self) -> i64 {
+        self.inner.lock().unwrap().state.tg_offset
+    }
+
+    pub fn set_tg_offset(&self, offset: i64) {
+        let mut inner = self.inner.lock().unwrap();
+        if offset > inner.state.tg_offset {
+            inner.state.tg_offset = offset;
+            let _ = self.save_locked(&mut inner);
+        }
     }
 
     pub fn set_owner(&self, id: i64) -> Result<()> {
@@ -514,5 +528,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _s1 = Store::open(dir.path()).unwrap();
         assert!(Store::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn tg_offset_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = Store::open(dir.path()).unwrap();
+            assert_eq!(s.tg_offset(), 0);
+            s.set_tg_offset(12345);
+            s.set_tg_offset(100); // 不允许倒退
+            assert_eq!(s.tg_offset(), 12345);
+        }
+        let s2 = Store::open(dir.path()).unwrap();
+        assert_eq!(s2.tg_offset(), 12345);
     }
 }

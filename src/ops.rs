@@ -19,7 +19,7 @@ use crate::bot::Bot;
 use crate::config::{
     validate_pin, validate_public_url, write_atomic, AgentConfig, ControlConfig, AGENT_CONFIG,
     AGENT_SERVICE, CONTROL_CONFIG, CONTROL_SERVICE, DEFAULT_REPO, ETC_DIR, PM_LINK, SBRELAY_BIN,
-    SINGBOX_BIN, SINGBOX_CONFIG, SINGBOX_SERVICE, TLS_CERT, TLS_KEY, VAR_DIR,
+    SINGBOX_BIN, SINGBOX_CONFIG, SINGBOX_SERVICE, SINGBOX_SERVICE_NAME, TLS_CERT, TLS_KEY, VAR_DIR,
 };
 use crate::control::{router, ControlState};
 use crate::singbox::SingboxManager;
@@ -286,13 +286,13 @@ pub async fn setup_agent(
         state_dir: PathBuf::from(VAR_DIR),
         singbox_bin: PathBuf::from(SINGBOX_BIN),
         singbox_config: PathBuf::from(SINGBOX_CONFIG),
-        service: "sing-box".into(),
+        service: SINGBOX_SERVICE_NAME.into(),
     };
     fs::create_dir_all(VAR_DIR)?;
     fs::set_permissions(VAR_DIR, fs::Permissions::from_mode(0o700))?;
     cfg.save(Path::new(AGENT_CONFIG))?;
 
-    // 4. 初始化 sing-box 单文件配置与服务
+    // 4. 初始化 sbrelay 专用 sing-box 配置与独立服务（不碰宿主机已有 sing-box.service）
     let sb = SingboxManager::system(
         cfg.singbox_config.clone(),
         cfg.singbox_bin.clone(),
@@ -308,11 +308,11 @@ pub async fn setup_agent(
     let (node, created) = sb.init_node(port_override, pass_override)?;
     if created {
         println!(
-            "已自动生成 SS2022 入站（端口 {}，{}）。",
+            "已自动生成 SS2022 入站（端口 {}，{}，配置位于 {SINGBOX_CONFIG}）。",
             node.port, node.method
         );
     } else {
-        println!("检测到已有 SS2022 入站（端口 {}），已原样保留。", node.port);
+        println!("检测到已有 sbrelay SS2022 入站（端口 {}），已原样保留。", node.port);
     }
 
     ensure_singbox_service(created)?;
@@ -334,7 +334,7 @@ pub async fn setup_agent(
          ProtectSystem=strict\n\
          ProtectHome=yes\n\
          PrivateTmp=yes\n\
-         ReadWritePaths={ETC_DIR} {VAR_DIR} /usr/local/etc/sing-box\n\
+         ReadWritePaths={ETC_DIR} {VAR_DIR}\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -456,33 +456,31 @@ async fn ensure_singbox_installed() -> Result<()> {
 
 fn ensure_singbox_service(force_restart: bool) -> Result<()> {
     let unit_path = Path::new(SINGBOX_SERVICE);
-    let mut need_reload = false;
-    if !unit_path.exists() {
-        let unit = format!(
-            "[Unit]\n\
-             Description=sing-box service\n\
-             After=network-online.target\n\
-             Wants=network-online.target\n\
-             \n\
-             [Service]\n\
-             Type=simple\n\
-             ExecStart={SINGBOX_BIN} run -c {SINGBOX_CONFIG}\n\
-             Restart=on-failure\n\
-             RestartSec=3s\n\
-             LimitNOFILE=65535\n\
-             \n\
-             [Install]\n\
-             WantedBy=multi-user.target\n"
-        );
+    let svc_unit = format!("{SINGBOX_SERVICE_NAME}.service");
+    let unit = format!(
+        "[Unit]\n\
+         Description=sbrelay dedicated sing-box service\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={SINGBOX_BIN} run -c {SINGBOX_CONFIG}\n\
+         Restart=on-failure\n\
+         RestartSec=3s\n\
+         LimitNOFILE=65535\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    );
+    let need_write = fs::read_to_string(unit_path).ok().as_deref() != Some(unit.as_str());
+    if need_write {
         write_atomic(unit_path, unit.as_bytes(), 0o644)?;
-        need_reload = true;
-    }
-    if need_reload {
         run_systemctl(&["daemon-reload"])?;
-        run_systemctl(&["enable", "sing-box.service"])?;
+        run_systemctl(&["enable", &svc_unit])?;
     }
-    if force_restart || !systemctl_active("sing-box.service") {
-        run_systemctl(&["restart", "sing-box.service"])?;
+    if force_restart || need_write || !systemctl_active(&svc_unit) {
+        run_systemctl(&["restart", &svc_unit])?;
     }
     Ok(())
 }
@@ -514,6 +512,12 @@ pub fn restart_services() -> Result<()> {
     if Path::new(AGENT_SERVICE).exists() {
         run_systemctl(&["restart", "sbrelay-agent.service"])?;
         println!("已重启 sbrelay-agent");
+        any = true;
+    }
+    if Path::new(SINGBOX_SERVICE).exists() {
+        let svc_unit = format!("{SINGBOX_SERVICE_NAME}.service");
+        run_systemctl(&["restart", &svc_unit])?;
+        println!("已重启 {SINGBOX_SERVICE_NAME}");
         any = true;
     }
     if !any {
@@ -549,34 +553,53 @@ pub fn show_status() {
     }
 
     if Path::new(SINGBOX_SERVICE).exists() {
-        println!("sing-box：{}", svc_state_str("sing-box.service"));
+        let svc_unit = format!("{SINGBOX_SERVICE_NAME}.service");
+        println!("sing-box ({SINGBOX_SERVICE_NAME})：{}", svc_state_str(&svc_unit));
     }
 }
 
 pub fn uninstall(purge: bool) -> Result<()> {
     require_root()?;
-    for svc in ["sbrelay-control.service", "sbrelay-agent.service"] {
-        let _ = run_systemctl(&["disable", "--now", svc]);
+    let mut removed_any_unit = false;
+    for (unit_path, svc) in [
+        (CONTROL_SERVICE, "sbrelay-control.service"),
+        (AGENT_SERVICE, "sbrelay-agent.service"),
+    ] {
+        if Path::new(unit_path).exists() {
+            let _ = run_systemctl(&["disable", "--now", svc]);
+            let _ = fs::remove_file(unit_path);
+            removed_any_unit = true;
+        }
     }
-    let _ = fs::remove_file(CONTROL_SERVICE);
-    let _ = fs::remove_file(AGENT_SERVICE);
-    let _ = run_systemctl(&["daemon-reload"]);
+    if removed_any_unit {
+        let _ = run_systemctl(&["daemon-reload"]);
+    }
 
     if purge {
-        println!("即将彻底删除 {ETC_DIR} 与 {VAR_DIR}（含 Bot token、证书、状态与切换备份）。");
+        println!(
+            "即将彻底删除 {ETC_DIR}（含 Bot token、证书与 sbrelay 专用 sing-box 配置）、{VAR_DIR}（状态与备份）以及 {SINGBOX_SERVICE_NAME} 服务。"
+        );
         let ans = prompt_line("确认彻底清除？输入 yes 继续：")?;
         if ans.trim() == "yes" {
+            if Path::new(SINGBOX_SERVICE).exists() {
+                let svc_unit = format!("{SINGBOX_SERVICE_NAME}.service");
+                let _ = run_systemctl(&["disable", "--now", &svc_unit]);
+                let _ = fs::remove_file(SINGBOX_SERVICE);
+                let _ = run_systemctl(&["daemon-reload"]);
+            }
             let _ = fs::remove_dir_all(ETC_DIR);
             let _ = fs::remove_dir_all(VAR_DIR);
             let _ = fs::remove_file(PM_LINK);
             let _ = fs::remove_file(SBRELAY_BIN);
-            println!("已彻底清除 sbrelay 服务与数据（未改动 sing-box 配置）。");
+            println!("已彻底清除 sbrelay 服务与数据（未改动宿主机原有的 sing-box 服务或配置）。");
         } else {
-            println!("已取消删除数据；服务已停止卸载，数据已保留。");
+            println!("已取消删除数据；控制端/Agent 服务已停止卸载，数据与 {SINGBOX_SERVICE_NAME} 已保留。");
         }
     } else {
-        println!("服务已卸载，配置与数据（{ETC_DIR}、{VAR_DIR}）已保留，重新安装可免令牌恢复。");
-        println!("说明：未改动 sing-box 配置与服务。");
+        println!(
+            "控制端/Agent 服务已卸载，配置与数据（{ETC_DIR}、{VAR_DIR}）及 {SINGBOX_SERVICE_NAME} 已保留，重新安装可免令牌恢复。"
+        );
+        println!("说明：未改动宿主机原有的 sing-box 配置与服务。");
     }
     Ok(())
 }

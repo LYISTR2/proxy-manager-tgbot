@@ -16,12 +16,13 @@ pub const AGENT_CONFIG: &str = "/etc/sbrelay/agent.toml";
 pub const TLS_CERT: &str = "/etc/sbrelay/tls.crt";
 pub const TLS_KEY: &str = "/etc/sbrelay/tls.key";
 pub const SINGBOX_BIN: &str = "/usr/local/bin/sing-box";
-pub const SINGBOX_CONFIG: &str = "/usr/local/etc/sing-box/config.json";
+pub const SINGBOX_CONFIG: &str = "/etc/sbrelay/sing-box.json";
+pub const SINGBOX_SERVICE_NAME: &str = "sbrelay-sing-box";
 pub const SBRELAY_BIN: &str = "/usr/local/bin/sbrelay";
 pub const PM_LINK: &str = "/usr/local/bin/pm";
 pub const CONTROL_SERVICE: &str = "/etc/systemd/system/sbrelay-control.service";
 pub const AGENT_SERVICE: &str = "/etc/systemd/system/sbrelay-agent.service";
-pub const SINGBOX_SERVICE: &str = "/etc/systemd/system/sing-box.service";
+pub const SINGBOX_SERVICE: &str = "/etc/systemd/system/sbrelay-sing-box.service";
 pub const DEFAULT_REPO: &str = "LYISTR2/proxy-manager-tgbot";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,7 +86,7 @@ fn default_singbox_config() -> PathBuf {
     PathBuf::from(SINGBOX_CONFIG)
 }
 fn default_service() -> String {
-    "sing-box".to_string()
+    SINGBOX_SERVICE_NAME.to_string()
 }
 
 impl ControlConfig {

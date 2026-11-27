@@ -1028,7 +1028,7 @@ impl Bot {
             info!("尚未绑定管理员：请在 Telegram 向 Bot 发送 /start");
         }
 
-        let mut offset: i64 = 0;
+        let mut offset: i64 = self.store.tg_offset();
         loop {
             if *shutdown.borrow() {
                 return;
@@ -1056,6 +1056,7 @@ impl Bot {
                 }
             };
             let updates: Vec<Update> = serde_json::from_value(val).unwrap_or_default();
+            let prev_offset = offset;
             for u in updates {
                 offset = u.update_id + 1;
                 if let Some(msg) = u.message {
@@ -1066,6 +1067,9 @@ impl Bot {
                     let bot = self.clone();
                     tokio::spawn(async move { bot.handle_callback(cb).await });
                 }
+            }
+            if offset > prev_offset {
+                self.store.set_tg_offset(offset);
             }
         }
     }

@@ -112,3 +112,92 @@ func TestAgentKeepDataUninstallKeepsPm(t *testing.T) {
 		t.Fatalf("unexpected pm references in uninstall_agent")
 	}
 }
+
+// pm.sh 的临时目录必须在主 shell 里创建，正常退出和异常退出（exit 非 0、INT、TERM、HUP、
+// set -e 下的 ERR、set -u 未定义变量）后都不能在 TMPDIR 里留下 pm-* 目录。
+func TestPmTmpDirCleanedOnExit(t *testing.T) {
+	pm := filepath.Join(findRepoRoot(t), "deploy", "pm.sh")
+	cases := []struct {
+		name string
+		body string
+		code int
+	}{
+		{"normal", `exit 0`, 0},
+		{"error-exit", `exit 3`, 3},
+		{"sigterm", `kill -TERM $$; sleep 5`, 143},
+		{"sigint", `kill -INT $$; sleep 5`, 130},
+		{"sighup", `kill -HUP $$; sleep 5`, 129},
+		{"errexit-err", `set -e; false; echo unreachable`, 1},
+		{"unbound-var", `echo "$PM_TEST_UNSET_VAR"`, 127},
+		{"fall-off-end", `true`, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			script := `source "$1"
+ensure_tmpdir || exit 90
+[ -d "$TMP_DIR" ] || exit 91
+case "$TMP_DIR" in "$TMPDIR"/pm-*) ;; *) exit 92 ;; esac
+touch "$TMP_DIR/install-agent.sh"
+# 二次调用复用同一目录，不再新建
+first=$TMP_DIR; ensure_tmpdir; [ "$TMP_DIR" = "$first" ] || exit 93
+` + tc.body + "\n"
+			cmd := exec.Command("bash", "-c", script, "pm-test", pm)
+			cmd.Env = append(os.Environ(), "TMPDIR="+base)
+			out, err := cmd.CombinedOutput()
+			code := 0
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			} else if err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if code != tc.code {
+				t.Fatalf("exit code = %d, want %d; out=%s", code, tc.code, out)
+			}
+			if strings.Contains(string(out), "unreachable") {
+				t.Fatal("set -e did not stop the script")
+			}
+			left, _ := filepath.Glob(filepath.Join(base, "pm-*"))
+			if len(left) != 0 {
+				t.Fatalf("leftover tmp dirs after %s: %v", tc.name, left)
+			}
+		})
+	}
+}
+
+// 回归：get_agent_script 在 $(...) 里调用时不得自己建临时目录（子 shell 建的目录 trap 清不到）；
+// 不开 errexit 时普通命令失败不能提前删掉还要用的临时目录。
+func TestPmTmpDirNotCreatedInSubshell(t *testing.T) {
+	root := findRepoRoot(t)
+	pm := filepath.Join(root, "deploy", "pm.sh")
+	b, err := os.ReadFile(pm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"$(tmpdir", "$(ensure_tmpdir", "`tmpdir", "`ensure_tmpdir"} {
+		if strings.Contains(string(b), bad) {
+			t.Fatalf("pm.sh creates tmp dir inside command substitution: %s", bad)
+		}
+	}
+	base := t.TempDir()
+	script := `source "$1"
+# 没有 TMP_DIR 时在子 shell 里取脚本：不能新建 pm-* 目录
+s=$(get_agent_script "https://127.0.0.1:1" "sha256//AAAA" 2>/dev/null || true)
+n=$(find "$TMPDIR" -maxdepth 1 -name 'pm-*' | wc -l)
+[ "$n" = 0 ] || { echo "subshell created dir"; exit 80; }
+ensure_tmpdir
+false
+grep -q nomatch /dev/null
+[ -d "$TMP_DIR" ] || { echo "tmp dir removed by non-fatal failure"; exit 81; }
+exit 0
+`
+	cmd := exec.Command("bash", "-c", script, "pm-test", pm)
+	cmd.Env = append(os.Environ(), "TMPDIR="+base)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	left, _ := filepath.Glob(filepath.Join(base, "pm-*"))
+	if len(left) != 0 {
+		t.Fatalf("leftover tmp dirs: %v", left)
+	}
+}

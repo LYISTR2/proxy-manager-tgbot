@@ -33,15 +33,38 @@ ok()   { printf '%s%s%s\n' "$C_G" "$*" "$C_0"; }
 warn() { printf '%s%s%s\n' "$C_Y" "$*" "$C_0"; }
 err()  { printf '%s%s%s\n' "$C_R" "$*" "$C_0" >&2; }
 
-cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
+# 临时目录：只能在主 shell 里用 ensure_tmpdir 创建（不要放进 $(...)），
+# 否则 TMP_DIR 只在子 shell 里有值，下面的 trap 拿不到路径，/tmp/pm-XXXXXX 会残留。
+cleanup() {
+  if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+  TMP_DIR=""
+  return 0
+}
+on_signal() {
+  local sig=$1 code=$2
+  trap - "$sig"
+  cleanup
+  exit "$code"
+}
+# pm 不开 errexit：普通命令失败不会退出，这时 ERR 不清理（目录还要接着用）；
+# 一旦开了 set -e，出错即退出，ERR 先清理，EXIT 再兜底。
+on_err() {
+  case $- in *e*) cleanup ;; esac
+  return 0
+}
 trap cleanup EXIT
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal HUP 129' HUP
+trap on_err ERR
 
-tmpdir() {
-  if [ -z "$TMP_DIR" ]; then
-    TMP_DIR=$(mktemp -d /tmp/pm-XXXXXX)
+ensure_tmpdir() {
+  if [ -z "${TMP_DIR:-}" ] || [ ! -d "$TMP_DIR" ]; then
+    TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pm-XXXXXX") || { TMP_DIR=""; return 1; }
     chmod 700 "$TMP_DIR"
   fi
-  printf '%s\n' "$TMP_DIR"
 }
 
 need_root() {
@@ -203,7 +226,8 @@ control_install() {
       err "缺少地址或指纹，已取消。首次安装也可以：克隆仓库后运行 sudo bash deploy/pm.sh。"
       return 1
     fi
-    dir="$(tmpdir)/control"
+    ensure_tmpdir || { err "无法创建临时目录。"; return 1; }
+    dir="$TMP_DIR/control"
     mkdir -p "$dir"
     for f in sbrelay sbrelay-helper; do
       fetch_pinned "$pk" "$url/pkg/$f" "$dir/$f" || { err "下载 $f 失败（地址或指纹不对）。"; return 1; }
@@ -286,10 +310,11 @@ parse_panel_cmd() {
 }
 
 get_agent_script() {
-  # 优先从控制端取最新脚本，失败再用本地副本
+  # 优先从控制端取最新脚本，失败再用本地副本。
+  # 本函数常在 $(...) 里调用，不能在这里建临时目录：调用方须先在主 shell 里 ensure_tmpdir。
   local url=$1 pk=$2 dst
-  dst="$(tmpdir)/install-agent.sh"
-  if [ -n "$url" ] && [ -n "$pk" ] && fetch_pinned "$pk" "$url/install-agent.sh" "$dst" 2>/dev/null && head -n1 "$dst" | grep -q '^#!/bin/bash'; then
+  dst="${TMP_DIR:+$TMP_DIR/install-agent.sh}"
+  if [ -n "$dst" ] && [ -n "$url" ] && [ -n "$pk" ] && fetch_pinned "$pk" "$url/install-agent.sh" "$dst" 2>/dev/null && head -n1 "$dst" | grep -q '^#!/bin/bash'; then
     printf '%s\n' "$dst"
     return 0
   fi
@@ -313,6 +338,7 @@ agent_install() {
           pk=$(spki_from_pin "$url" "$pin" || true)
           [ -n "$pk" ] || { err "控制端证书与已保存的指纹不一致或连不上，已中止。"; return 1; }
         fi
+        ensure_tmpdir || true
         script=$(get_agent_script "$url" "$pk") || { err "找不到 install-agent.sh。"; return 1; }
         bash "$script" --update --url "$url" --pin "$pin" --pubkey "$pk"
         return
@@ -356,6 +382,7 @@ agent_install() {
     pk=$(spki_from_pin "$url" "$pin" || true)
     [ -n "$pk" ] || { err "控制端证书与指纹不一致或连不上，已中止。"; P_TOK=""; return 1; }
   fi
+  ensure_tmpdir || true
   script=$(get_agent_script "$url" "$pk") || { err "下载 install-agent.sh 失败。"; P_TOK=""; return 1; }
   # 令牌只经环境变量交给安装脚本，不出现在进程参数里
   SBRELAY_TOKEN="$P_TOK" bash "$script" $force_flag --url "$url" --pin "$pin" --pubkey "$pk" --role "$role"

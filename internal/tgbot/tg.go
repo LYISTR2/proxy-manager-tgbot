@@ -280,10 +280,13 @@ func formatSSLink(n *relaycfg.NodeInfo, displayName string) string {
 	return fmt.Sprintf("ss://%s@%s#%s", userinfo, hostPort, tag)
 }
 
-// outboundLabel 优先解析为「直连」、已绑定落地机的实时显示名，再回退到控制端保存的落地显示名。
+// outboundLabel 优先解析为「本机直出」、已绑定落地机的实时显示名，再回退到控制端保存的落地显示名。
 func (b *Bot) outboundLabel(mid, outTag string) (string, bool) {
-	if outTag == "direct" {
-		return "直连（未选落地）", true
+	switch outTag {
+	case relaycfg.LocalEgressTag:
+		return relaycfg.LocalEgressLabel, true
+	case "direct":
+		return relaycfg.LocalEgressLabel + "（未选落地）", true
 	}
 	if strings.HasPrefix(outTag, relaycfg.OutPrefix) {
 		lid := strings.TrimPrefix(outTag, relaycfg.OutPrefix)
@@ -404,7 +407,11 @@ func (b *Bot) machineText(id string) (string, *Keyboard, error) {
 			if !named {
 				lname = "未命名落地"
 			}
-			fmt.Fprintf(&sb, "  %d. 当前落地：%s%s\n", i+1, escape(lname), escape(debugTag(r.Outbound)))
+			what := "当前落地"
+			if relaycfg.IsLocalEgress(r.Outbound) {
+				what = "当前出口"
+			}
+			fmt.Fprintf(&sb, "  %d. %s：%s%s\n", i+1, what, escape(lname), escape(debugTag(r.Outbound)))
 			rows = append(rows, row(Btn{Text: switchLandingButtonText(i, len(st.Relays)), Data: "r:" + id + ":" + strconv.Itoa(i)}))
 		}
 		rows = append(rows, row(Btn{Text: "回滚上次切换", Data: "rb:" + id}, Btn{Text: "刷新", Data: "rs:" + id}))
@@ -539,9 +546,17 @@ func (b *Bot) pickText(id string, idx int) (string, *Keyboard) {
 		rows = append(rows, row(Btn{Text: "切到「" + lname + "」", Data: "c:" + pid}))
 	}
 
+	// 3. 本机直出：线路机自己出网，不经落地，也不需要任何落地机
+	if relaycfg.IsLocalEgress(r.Outbound) {
+		rows = append(rows, row(Btn{Text: relaycfg.LocalEgressLabel + "（当前）", Data: "noop"}))
+	} else {
+		pid := b.putPend(fmt.Sprintf("%s|%s|%s", id, r.Inbound, relaycfg.LocalEgressTag))
+		rows = append(rows, row(Btn{Text: "切到「" + relaycfg.LocalEgressLabel + "」（不经落地）", Data: "c:" + pid}))
+	}
+
 	if totalChoices == 0 {
-		sb.WriteString("还没有可用的落地机。请先在首页点「添加落地机」并完成绑定。")
-	} else if totalChoices == 1 && r.Outbound != "direct" {
+		sb.WriteString("还没有可用的落地机，可以先用「本机直出」，或在首页点「添加落地机」并完成绑定。")
+	} else if totalChoices == 1 && !relaycfg.IsLocalEgress(r.Outbound) {
 		sb.WriteString("当前仅有 1 个可用落地；可再绑定更多落地机以便随时切换。")
 	}
 	rows = append(rows, row(Btn{Text: "返回", Data: "m:" + id}))
@@ -566,6 +581,10 @@ func (b *Bot) confirmText(pid string) (string, *Keyboard) {
 	lname, _ := b.outboundLabel(mid, out)
 	text := fmt.Sprintf("确认把线路机「%s」的这条中转切到落地「%s」？\n（内部：%s → %s）\n会短暂重启线路机 sing-box，转发可能中断几秒。入站地址和密码不会改。",
 		escape(b.relayTitle(m)), escape(lname), escape(inbound), escape(out))
+	if out == relaycfg.LocalEgressTag {
+		text = fmt.Sprintf("确认把线路机「%s」的这条中转改为「%s」？\n流量直接从线路机自己的 IP 出去，不经任何落地。\n（内部：%s → %s）\n会短暂重启线路机 sing-box，转发可能中断几秒。入站地址和密码不会改。",
+			escape(b.relayTitle(m)), relaycfg.LocalEgressLabel, escape(inbound), escape(out))
+	}
 	return text, kb(row(Btn{Text: "确认切换", Data: "x:" + pid}, Btn{Text: "取消", Data: "m:" + mid}))
 }
 

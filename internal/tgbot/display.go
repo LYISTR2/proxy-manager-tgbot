@@ -68,7 +68,7 @@ func hintsFromStatus(st *relaycfg.Status) []store.LandingHint {
 	}
 	fromRelay := map[string]string{}
 	for _, r := range st.Relays {
-		if r.Outbound != "" && r.Outbound != "direct" && r.NodeName != "" && fromRelay[r.Outbound] == "" {
+		if r.Outbound != "" && !relaycfg.IsLocalEgress(r.Outbound) && r.NodeName != "" && fromRelay[r.Outbound] == "" {
 			fromRelay[r.Outbound] = r.NodeName
 		}
 	}

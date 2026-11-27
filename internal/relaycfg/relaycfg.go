@@ -17,7 +17,18 @@ const (
 	OutPrefix      = "relay-out-"
 	AutoRelayInTag = "sbrelay-ss2022-in"
 	AutoLandingTag = "sbrelay-landing-in"
+	// LocalEgressTag 是「本机直出」出站：线路机自己的 direct 出站，不经任何落地。
+	// 由 sbrelay 写进 relay.json（不依赖 config.json 里是否有 direct），不带 relay-out- 前缀，
+	// 因此不会被当成落地候选，也不会和脚本/落地机的出站重名。
+	LocalEgressTag   = "sbrelay-local-direct"
+	LocalEgressLabel = "本机直出"
 )
+
+// IsLocalEgress 判断出站是否为线路机本机直出：sbrelay 自建的本机直出出站，
+// 或自动入站 sbrelay-ss2022-in 初始未选落地时的 "direct"。
+func IsLocalEgress(tag string) bool {
+	return tag == LocalEgressTag || tag == "direct"
+}
 
 // TagRe 限制 tag 字符集：tag 来自 TG 回调，必须防止注入奇怪字符进日志/配置。
 var TagRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
@@ -124,7 +135,7 @@ func isRelayRule(r *ojson.Object) bool {
 	if !ok1 || !ok2 || in == "" {
 		return false
 	}
-	if strings.HasPrefix(out, OutPrefix) {
+	if strings.HasPrefix(out, OutPrefix) || out == LocalEgressTag {
 		return true
 	}
 	return in == AutoRelayInTag && out == "direct"
@@ -291,6 +302,34 @@ func upsertOutbound(relay *ojson.Object, sp *OutboundSpec) *ojson.Object {
 	return obj
 }
 
+// ensureLocalEgress 确保 relay.json 里有本机直出出站 {"type":"direct","tag":LocalEgressTag}；
+// 同名但不是 direct 的出站会被改正，避免把流量送到别处。
+func ensureLocalEgress(relay *ojson.Object) *ojson.Object {
+	outV, ok := relay.Get("outbounds")
+	arr, _ := outV.([]any)
+	if !ok || arr == nil {
+		arr = []any{}
+	}
+	for i, e := range arr {
+		if o, ok := e.(*ojson.Object); ok && o.Str("tag") == LocalEgressTag {
+			if o.Str("type") == "direct" {
+				return o
+			}
+			obj := ojson.NewObject()
+			obj.Set("type", "direct")
+			obj.Set("tag", LocalEgressTag)
+			arr[i] = obj
+			relay.Set("outbounds", arr)
+			return obj
+		}
+	}
+	obj := ojson.NewObject()
+	obj.Set("type", "direct")
+	obj.Set("tag", LocalEgressTag)
+	relay.Set("outbounds", append(arr, obj))
+	return obj
+}
+
 // Switch 把 inbound 对应中转规则的 outbound 改为 target，并同步 relay_links.json 的落地元数据。
 // links 文件不存在时传 nil，返回的 newLinks 也为 nil（不凭空创建脚本的文件）。
 func Switch(relayJSON, linksJSON []byte, inbound, target string) (newRelay, newLinks []byte, from string, err error) {
@@ -299,10 +338,15 @@ func Switch(relayJSON, linksJSON []byte, inbound, target string) (newRelay, newL
 
 // SwitchWithSpec 支持在切换前先写入/更新目标落地出站（来自已绑定的落地机），且绝不修改 inbounds。
 // 当 target == "direct" 且 inbound == AutoRelayInTag 时允许切回直连（例如回滚到初始态）。
+// 当 target == LocalEgressTag 时切到本机直出：任何中转入站都可用，不需要落地出站参数。
 func SwitchWithSpec(relayJSON, linksJSON []byte, inbound, target string, spec *OutboundSpec) (newRelay, newLinks []byte, from string, err error) {
 	allowDirect := inbound == AutoRelayInTag && target == "direct"
-	if !TagRe.MatchString(inbound) || !TagRe.MatchString(target) || (!allowDirect && !strings.HasPrefix(target, OutPrefix)) {
+	local := target == LocalEgressTag
+	if !TagRe.MatchString(inbound) || !TagRe.MatchString(target) || (!allowDirect && !local && !strings.HasPrefix(target, OutPrefix)) {
 		return nil, nil, "", fmt.Errorf("参数不合法")
+	}
+	if local && spec != nil {
+		return nil, nil, "", fmt.Errorf("本机直出不需要落地出站参数")
 	}
 	if spec != nil {
 		if spec.Tag == "" {
@@ -333,6 +377,8 @@ func SwitchWithSpec(relayJSON, linksJSON []byte, inbound, target string, spec *O
 			}
 		}
 		tgt = upsertOutbound(relay, spec)
+	} else if local {
+		tgt = ensureLocalEgress(relay)
 	} else if !allowDirect {
 		outV, _ := relay.Get("outbounds")
 		for _, o := range objs(outV) {
@@ -366,6 +412,10 @@ func SwitchWithSpec(relayJSON, linksJSON []byte, inbound, target string, spec *O
 	if from == target && !specChanged {
 		return nil, nil, from, ErrNoop
 	}
+	// 自动入站初始的 "direct" 与本机直出出口相同，不必为此重启 sing-box
+	if local && IsLocalEgress(from) {
+		return nil, nil, from, ErrNoop
+	}
 	hit.Set("outbound", target)
 	newRelay = ojson.Marshal(relay)
 	if linksJSON != nil {
@@ -375,7 +425,7 @@ func SwitchWithSpec(relayJSON, linksJSON []byte, inbound, target string, spec *O
 		}
 		if lv, ok := links.Get(inbound); ok {
 			if lo, ok := lv.(*ojson.Object); ok {
-				if tgt != nil {
+				if tgt != nil && !local {
 					// 脚本写法是 "${dest_addr}:${dest_port}"，IPv6 不加括号，这里保持一致。
 					lo.Set("landing_addr", tgt.Str("server")+":"+strconv.FormatInt(tgt.Int("server_port"), 10))
 					lo.Set("landing_type", Label(tgt))

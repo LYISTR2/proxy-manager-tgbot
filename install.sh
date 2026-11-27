@@ -1,5 +1,6 @@
 #!/bin/bash
-# sbrelay 一键安装入口（在克隆下来的仓库根目录运行）。
+# sbrelay 一键安装入口。可直接远程运行（自动下载仓库源码到临时目录，用完即删），也可在仓库目录运行：
+#   bash <(curl -fsSL https://raw.githubusercontent.com/LYISTR2/proxy-manager-tgbot/main/install.sh) [参数]
 #   sudo bash install.sh                         交互选择：控制端 / 线路机 / 落地机 / 状态 / 卸载
 #   sudo bash install.sh --role control          安装 / 更新控制端（Bot token 不回显输入，或用环境变量 SBRELAY_TG_TOKEN）
 #   sudo bash install.sh --role relay|landing    安装 agent：粘贴面板给的安装命令（不回显）
@@ -11,16 +12,22 @@
 set -uo pipefail
 set +x
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SELF_PATH=${BASH_SOURCE[0]:-}
+ROOT_DIR=$(cd "$(dirname "${SELF_PATH:-.}")" 2>/dev/null && pwd)
+[ -n "$ROOT_DIR" ] || ROOT_DIR=$PWD
 DEPLOY_DIR=$ROOT_DIR/deploy
 GO_MIN=1.24
 WORK=""
+SRC_WORK=""
+# 不在仓库里运行时下载的源码包；可用 SBRELAY_REF 指定分支 / 标签 / 提交，SBRELAY_REPO_TARBALL 覆盖地址（测试或镜像用）
+REPO_SLUG=LYISTR2/proxy-manager-tgbot
+REPO_REF=${SBRELAY_REF:-main}
 
 ROLE=""; URL=""; PIN=""; PUBKEY=""; ACTION=install
 DRY_RUN=0; NO_DEPS=0; NO_GO_DOWNLOAD=0
 LISTEN=""; PUBLIC_URL=""
 
-usage() { sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; cat <<'U'
+usage() { sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; cat <<'U'
 
 参数：
   --role control|relay|landing   要装的角色
@@ -29,15 +36,19 @@ usage() { sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; cat <<'U'
   --status | --uninstall | --purge
   --no-deps            不自动安装缺少的系统依赖
   --no-go-download     本机没有合适的 Go 时不自动下载（控制端需要 Go ≥ 1.24 编译）
-  --dry-run            只打印将要执行的步骤，不改动系统
+  --dry-run            只打印将要执行的步骤，不改动系统（远程运行时仍会下载源码到临时目录以便核对）
+环境变量：SBRELAY_REF（下载哪个分支/标签/提交，默认 main）、SBRELAY_TG_TOKEN、SBRELAY_TOKEN
 U
 }
 
 cleanup() {
-  if [ -n "$WORK" ] && [ -d "$WORK" ]; then
-    rm -rf -- "$WORK"
-  fi
-  WORK=""
+  local d
+  for d in "$WORK" "$SRC_WORK"; do
+    if [ -n "$d" ] && [ -d "$d" ]; then
+      rm -rf -- "$d"
+    fi
+  done
+  WORK=""; SRC_WORK=""
   return 0
 }
 trap cleanup EXIT
@@ -162,13 +173,32 @@ sys.exit(1)' "$arch") || die "获取 Go 下载信息失败。"
   say "已准备临时 Go：$(go env GOVERSION)"
 }
 
-need_repo() {
-  local f
-  for f in "$ROOT_DIR/go.mod" "$DEPLOY_DIR/install-control.sh" "$DEPLOY_DIR/install-agent.sh" "$DEPLOY_DIR/pm.sh"; do
-    if [ ! -f "$f" ]; then
-      die "找不到 deploy/ 下的安装脚本。请在克隆下来的仓库根目录运行：sudo bash install.sh"
-    fi
+is_repo() {
+  local d=$1 f
+  for f in "$d/go.mod" "$d/deploy/install-control.sh" "$d/deploy/install-agent.sh" "$d/deploy/pm.sh"; do
+    [ -f "$f" ] || return 1
   done
+}
+
+# 在仓库目录运行就直接用；否则（例如 bash <(curl ...)）下载源码包到临时目录，退出时删除。
+ensure_repo() {
+  local url
+  if is_repo "$ROOT_DIR"; then
+    return 0
+  fi
+  case "$REPO_REF" in ''|*[!A-Za-z0-9._/-]*|*..*) die "SBRELAY_REF 不合法。" 2 ;; esac
+  url=${SBRELAY_REPO_TARBALL:-https://codeload.github.com/$REPO_SLUG/tar.gz/$REPO_REF}
+  SRC_WORK=$(mktemp -d "${TMPDIR:-/tmp}/sbrelay-src-XXXXXX") || die "无法创建临时目录。"
+  chmod 700 "$SRC_WORK"
+  say "正在下载源码（$REPO_SLUG@$REPO_REF）到临时目录，安装结束后自动删除..."
+  curl -fsSL --proto '=https,file' --connect-timeout 20 --max-time 300 "$url" -o "$SRC_WORK/src.tar.gz" || die "下载源码失败：$url"
+  mkdir -p "$SRC_WORK/src"
+  tar -xzf "$SRC_WORK/src.tar.gz" -C "$SRC_WORK/src" --strip-components=1 --no-same-owner || die "解压源码失败。"
+  rm -f "$SRC_WORK/src.tar.gz"
+  is_repo "$SRC_WORK/src" || die "下载的源码不完整（缺 deploy/ 安装脚本）。"
+  ROOT_DIR=$SRC_WORK/src
+  DEPLOY_DIR=$ROOT_DIR/deploy
+  say "源码已就绪。"
 }
 
 choose_role() {
@@ -208,7 +238,7 @@ install_control() {
   [ -n "$PUBLIC_URL" ] && envs+=("SBRELAY_PUBLIC_URL=${PUBLIC_URL%/}")
   if [ "$DRY_RUN" = 1 ]; then
     if have_go; then say "[dry-run] 使用本机 Go 编译"; else say "[dry-run] 下载官方 Go 到临时目录编译"; fi
-    say "[dry-run] bash deploy/install-control.sh（Bot token：$([ -n "${SBRELAY_TG_TOKEN:-}" ] && echo 环境变量已提供 || echo 不回显输入)）"
+    say "[dry-run] bash $DEPLOY_DIR/install-control.sh（Bot token：$([ -n "${SBRELAY_TG_TOKEN:-}" ] && echo 环境变量已提供 || echo 不回显输入)）"
     return 0
   fi
   ensure_go
@@ -237,7 +267,7 @@ install_agent() {
   local -a args=(--url "${URL%/}" --pin "$PIN" --role "$ROLE")
   [ -n "$PUBKEY" ] && args+=(--pubkey "$PUBKEY")
   if [ "$DRY_RUN" = 1 ]; then
-    say "[dry-run] bash deploy/install-agent.sh ${args[*]}（令牌：$([ -n "$tok" ] && echo 已提供 || echo 未提供)，经环境变量传递）"
+    say "[dry-run] bash $DEPLOY_DIR/install-agent.sh ${args[*]}（令牌：$([ -n "$tok" ] && echo 已提供 || echo 未提供)，经环境变量传递）"
     return 0
   fi
   SBRELAY_TOKEN="$tok" bash "$DEPLOY_DIR/install-agent.sh" "${args[@]}"
@@ -258,13 +288,13 @@ do_uninstall() {
 
 main() {
   parse_args "$@"
-  need_repo
   if [ "$DRY_RUN" != 1 ] && [ "$(id -u)" -ne 0 ]; then
-    die "请用 root 运行：sudo bash install.sh"
+    die "请用 root 运行（例如 sudo -i 后再执行）。"
   fi
   if [ "$DRY_RUN" != 1 ]; then
     ensure_deps
   fi
+  ensure_repo
   if [ "$ACTION" = install ] && [ -z "$ROLE" ]; then
     choose_role
   fi
@@ -280,7 +310,10 @@ main() {
   esac
 }
 
-# 允许被 source（测试用），直接执行时才运行
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+# 允许被 source（测试用），直接执行时才运行。
+# curl ... | bash 时脚本来自标准输入，后面的不回显输入会吃掉脚本本身，所以要求用 bash <(curl ...)。
+if [ -z "$SELF_PATH" ]; then
+  die "请这样运行：bash <(curl -fsSL https://raw.githubusercontent.com/$REPO_SLUG/main/install.sh) [参数]" 2
+elif [ "$SELF_PATH" = "$0" ]; then
   main "$@"
 fi

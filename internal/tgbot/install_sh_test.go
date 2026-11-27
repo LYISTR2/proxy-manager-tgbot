@@ -109,18 +109,66 @@ func TestInstallShDryRunControlAndUninstall(t *testing.T) {
 	}
 }
 
-// 单独拷出 install.sh（不在仓库里）时给出明确提示。
-func TestInstallShNeedsRepo(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join(findRepoRoot(t), "install.sh"))
+// 不在仓库里运行（bash <(curl ...)）时自动下载源码包到临时目录，用完即删。用 file:// 源码包代替网络。
+func TestInstallShBootstrapsOutsideRepo(t *testing.T) {
+	root := findRepoRoot(t)
+	b, err := os.ReadFile(filepath.Join(root, "install.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := filepath.Join(t.TempDir(), "install.sh")
-	if err := os.WriteFile(p, b, 0755); err != nil {
+	work := t.TempDir()
+	standalone := filepath.Join(work, "install.sh")
+	if err := os.WriteFile(standalone, b, 0755); err != nil {
 		t.Fatal(err)
 	}
-	out, code := runInstallSh(t, p, nil, "--role", "control", "--dry-run")
-	if code == 0 || !strings.Contains(out, "仓库根目录") {
-		t.Fatalf("standalone: %d %s", code, out)
+	tarball := filepath.Join(work, "src.tar.gz")
+	if out, err := exec.Command("tar", "-czf", tarball, "--transform", "s,^,proxy-manager-tgbot-main/,", "-C", root, "install.sh", "go.mod", "deploy").CombinedOutput(); err != nil {
+		t.Fatalf("tar: %v %s", err, out)
+	}
+	tmp := t.TempDir()
+	env := []string{"TMPDIR=" + tmp, "SBRELAY_REPO_TARBALL=file://" + tarball, "SBRELAY_TOKEN=" + fakeOneClickToken}
+	out, code := runInstallSh(t, standalone, env, "--role", "relay", "--url", "https://ctl.example:8443", "--pin", strings.Repeat("cd", 32), "--dry-run")
+	if code != 0 || !strings.Contains(out, "源码已就绪") || !strings.Contains(out, "/src/deploy/install-agent.sh") || strings.Contains(out, fakeOneClickToken) {
+		t.Fatalf("bootstrap: %d %s", code, out)
+	}
+	if !strings.HasPrefix(strings.SplitN(out[strings.Index(out, "[dry-run] bash ")+len("[dry-run] bash "):], "/src/", 2)[0], tmp) {
+		t.Fatalf("source not under TMPDIR: %s", out)
+	}
+	if left, _ := os.ReadDir(tmp); len(left) != 0 {
+		t.Fatalf("temp not cleaned: %v", left)
+	}
+	// 源码包不完整：报错且清理临时目录
+	bad := filepath.Join(work, "bad.tar.gz")
+	if out, err := exec.Command("tar", "-czf", bad, "--transform", "s,^,x/,", "-C", root, "install.sh").CombinedOutput(); err != nil {
+		t.Fatalf("tar: %v %s", err, out)
+	}
+	out, code = runInstallSh(t, standalone, []string{"TMPDIR=" + tmp, "SBRELAY_REPO_TARBALL=file://" + bad}, "--role", "control", "--dry-run")
+	if code == 0 || !strings.Contains(out, "不完整") {
+		t.Fatalf("bad tarball: %d %s", code, out)
+	}
+	if left, _ := os.ReadDir(tmp); len(left) != 0 {
+		t.Fatalf("temp not cleaned after failure: %v", left)
+	}
+	// SBRELAY_REF 不合法直接拒绝，不发请求
+	out, code = runInstallSh(t, standalone, []string{"TMPDIR=" + tmp, "SBRELAY_REF=../x"}, "--role", "control", "--dry-run")
+	if code != 2 {
+		t.Fatalf("bad ref: %d %s", code, out)
+	}
+}
+
+// curl ... | bash 会让后续不回显输入吃掉脚本本身，必须拒绝并提示 bash <(curl ...)。
+func TestInstallShRefusesPipe(t *testing.T) {
+	sh := filepath.Join(findRepoRoot(t), "install.sh")
+	cmd := exec.Command("bash", "-s", "--", "--role", "control", "--dry-run")
+	f, err := os.Open(sh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cmd.Stdin = f
+	out, err := cmd.CombinedOutput()
+	ee, ok := err.(*exec.ExitError)
+	if !ok || ee.ExitCode() != 2 || !strings.Contains(string(out), "bash <(curl") {
+		t.Fatalf("pipe mode: %v %s", err, out)
 	}
 }

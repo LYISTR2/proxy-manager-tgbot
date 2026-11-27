@@ -4,15 +4,21 @@
 
 ## 一键安装
 
-控制端（首次部署，在仓库目录运行；仓库为私有，需已登录 GitHub 的 git / SSH 密钥）：
+以 root 执行（先 `sudo -i`；不需要 git，脚本会自动下载源码到临时目录，用完即删）：
 
 ```bash
-git clone git@github.com:LYISTR2/proxy-manager-tgbot.git && cd proxy-manager-tgbot && sudo bash install.sh --role control
+bash <(curl -fsSL https://raw.githubusercontent.com/LYISTR2/proxy-manager-tgbot/main/install.sh)
+```
+
+不带参数是交互菜单；直接装控制端：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/LYISTR2/proxy-manager-tgbot/main/install.sh) --role control
 ```
 
 线路机 / 落地机：在 Bot 里点「添加线路机 / 添加落地机」，把面板给的一行命令以 root 执行即可（令牌走环境变量，不进进程参数）。
 
-已有控制端时，任意机器打开管理菜单（`-k` 只跳过系统 CA，真正校验的是公钥指纹）：
+已有控制端时，任意机器也可从控制端打开管理菜单（`-k` 只跳过系统 CA，真正校验的是公钥指纹）：
 
 ```bash
 curl -LfsS --tlsv1.2 -k --pinnedpubkey sha256//<公钥指纹> https://<控制端>:8443/pm.sh -o /tmp/pm.sh && sudo bash /tmp/pm.sh
@@ -31,20 +37,20 @@ Bot 功能：添加 / 重命名 / 删除机器，查看节点链接，**换落�
 ## 快速开始
 
 1. 在 [@BotFather](https://t.me/BotFather) 创建 Bot，拿到 token。
-2. 控制端：`sudo bash install.sh --role control`，按提示输入 token（不回显）。没有 Go ≥ 1.24 时会临时下载官方 Go（校验 SHA-256）编译，结束即删。
+2. 控制端：运行上面的一键命令并选「控制端」（或加 `--role control`），按提示输入 token（不回显）。没有 Go ≥ 1.24 时会临时下载官方 Go（校验 SHA-256）编译，结束即删。
 3. 在 Telegram 给 Bot 发 `/start`，第一个发的人成为管理员。
 4. 点「添加线路机」「添加落地机」，到对应机器以 root 执行面板命令。
 5. 线路机面板 → 「换落地」→ 选落地机或「本机直出」→ 确认。
 
-`install.sh` 其他用法：
+一键命令后面可加的参数（克隆仓库后 `sudo bash install.sh ...` 也一样）：
 
 ```bash
-sudo bash install.sh                       # 交互菜单
-sudo bash install.sh --role relay          # 粘贴面板命令安装 agent（不回显）
-sudo bash install.sh --role landing --url https://<控制端>:8443 --pin <证书指纹>   # 令牌按提示输入
-sudo bash install.sh --status | --uninstall | --purge
-sudo bash install.sh --help
+--role control | relay | landing      # 指定角色；relay/landing 不带 --url 时粘贴面板命令（不回显）
+--url https://<控制端>:8443 --pin <证书指纹>   # agent 非交互安装，令牌按提示输入或预先 export SBRELAY_TOKEN
+--status | --uninstall | --purge | --dry-run | --help
 ```
+
+需要固定版本时设 `SBRELAY_REF=<分支/标签/提交>`。请用 `bash <(curl ...)`，不要用 `curl ... | bash`（后者无法安全读取不回显输入，脚本会拒绝）。
 
 ## 管理菜单 pm
 

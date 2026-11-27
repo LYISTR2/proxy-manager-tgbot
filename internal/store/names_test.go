@@ -192,10 +192,12 @@ func TestOpenPreservesLandingNames(t *testing.T) {
 	if err := st.SetLandingName("m1", "relay-out-20001", "Landing-A"); err != nil {
 		t.Fatal(err)
 	}
+	_ = st.Close()
 	st2, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer st2.Close()
 	if st2.LandingName("m1", "relay-out-20001") != "Landing-A" || st2.RelayDisplayName("m1") != "HK-01" {
 		t.Fatal("not persisted")
 	}

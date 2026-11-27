@@ -5,9 +5,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"sbrelay/internal/tlspin"
+)
+
+var (
+	installURLRe   = regexp.MustCompile(`^https://(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._-]+)(:[0-9]+)?$`)
+	installPinRe   = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	installSPKIRe  = regexp.MustCompile(`^sha256//[A-Za-z0-9+/=]+$`)
+	installTokenRe = regexp.MustCompile(`^[0-9a-f]+$`)
 )
 
 // LoadTLSFiles 保持兼容：只返回证书 DER 的 SHA-256 hex。
@@ -85,17 +93,20 @@ func (b *Bot) handlePkg(w http.ResponseWriter, r *http.Request) {
 // InstallScript 生成面板里的一行安装命令。令牌只作为 bash 的环境变量传入，
 // 不出现在进程参数（ps）里，也不进脚本文件。行首空格配合 HISTCONTROL=ignorespace，尽量不写入 shell 历史。
 func (b *Bot) InstallScript(token string) string {
-	url := strings.TrimRight(b.cfg.PublicURL, "/")
-	pin := b.pin
-	spki := b.spkiPin
+	url := strings.TrimRight(strings.TrimSpace(b.cfg.PublicURL), "/")
+	pin := strings.TrimSpace(b.pin)
+	spki := strings.TrimSpace(b.spkiPin)
+	if !installURLRe.MatchString(url) || !installPinRe.MatchString(pin) || !installSPKIRe.MatchString(spki) || !installTokenRe.MatchString(token) {
+		return "错误：控制端地址、TLS 指纹或安装令牌格式不合法，已拒绝生成安装命令。"
+	}
 	var sb strings.Builder
 	sb.WriteString("export HISTCONTROL=ignorespace\n")
 	sb.WriteString("# 下一行行首有空格，尽量不写入 shell 历史。令牌不要转发到群聊。\n")
 	sb.WriteString("# -k 只跳过系统 CA（自签证书）；真正校验的是 --pinnedpubkey。\n")
-	fmt.Fprintf(&sb, " curl -LfsS --tlsv1.2 -k --pinnedpubkey %s %s/install-agent.sh | SBRELAY_TOKEN=%s bash -s -- --url %s --pin %s --pubkey %s\n",
+	fmt.Fprintf(&sb, " curl -LfsS --tlsv1.2 -k --pinnedpubkey %s '%s/install-agent.sh' | SBRELAY_TOKEN=%s bash -s -- --url '%s' --pin '%s' --pubkey '%s'\n",
 		spki, url, token, url, pin, spki)
 	sb.WriteString("# 也可运行交互菜单 pm，选 2 后粘贴上面这一行：\n")
-	fmt.Fprintf(&sb, "# curl -LfsS --tlsv1.2 -k --pinnedpubkey %s %s/pm.sh -o /tmp/pm.sh && bash /tmp/pm.sh\n", spki, url)
+	fmt.Fprintf(&sb, "# curl -LfsS --tlsv1.2 -k --pinnedpubkey '%s' '%s/pm.sh' -o /tmp/pm.sh && bash /tmp/pm.sh\n", spki, url)
 	sb.WriteString("# 卸载（不改 sing-box）：pm 选 6，或下载 install-agent.sh 后加 --uninstall\n")
 	return sb.String()
 }

@@ -1,16 +1,20 @@
-# 凭据与运行态绝不入库
+# Build artifacts
+/target/
+dist/
+bin/
+
+# Credentials & runtime state (never commit)
 *.env
 .env*
 secrets.env
+control.toml
+agent.toml
 state.json
 *.tar.gz
 *.pem
+*.crt
 *.key
 id_*
 *.pub
-dist/
-bin/
 *-data/
-/sbrelay
-/sbrelay-helper
 /tmp/

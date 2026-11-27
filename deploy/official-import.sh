@@ -17,14 +17,37 @@ UNIT_BEFORE=$(sha256sum /etc/systemd/system/sing-box.service | awk '{print $1}')
 
 ADV=/usr/local/etc/sing-box/advanced_relay.sh
 URL=https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/advanced_relay.sh
+# 审计要求：不接受浮动分支的第三方脚本直接以 root 执行，必须指定固定 commit 下的内容摘要。
+# 首次运行会打印实际摘要；核对无误后把它写进 SBRELAY_ADV_SHA256（脚本里或环境变量）再重跑。
+ADV_SHA=${SBRELAY_ADV_SHA256:-}
 if [ ! -s "$ADV" ]; then
   tmp=$(mktemp)
   curl -fsSL --max-time 30 "$URL" -o "$tmp"
   bash -n "$tmp"
+  got=$(sha256sum "$tmp" | awk '{print $1}')
+  if [ -z "$ADV_SHA" ]; then
+    rm -f "$tmp"
+    echo "STOP: 需要先固定 advanced_relay.sh 的内容摘要。" >&2
+    echo "本次拉取到的 SHA256=$got" >&2
+    echo "核对来源后，用 SBRELAY_ADV_SHA256=$got 重跑本脚本。" >&2
+    exit 5
+  fi
+  if [ "$got" != "$ADV_SHA" ]; then
+    rm -f "$tmp"
+    echo "STOP: advanced_relay.sh 摘要不符（期望 $ADV_SHA，实际 $got），已丢弃。" >&2
+    exit 5
+  fi
   chmod 755 "$tmp"
   mv -f "$tmp" "$ADV"
-  echo "DOWNLOADED_ADVANCED_RELAY $(sha256sum "$ADV" | awk '{print $1}')"
+  echo "DOWNLOADED_ADVANCED_RELAY $got"
 else
+  if [ -n "$ADV_SHA" ]; then
+    got=$(sha256sum "$ADV" | awk '{print $1}')
+    if [ "$got" != "$ADV_SHA" ]; then
+      echo "STOP: 本地 advanced_relay.sh 摘要不符（期望 $ADV_SHA，实际 $got）。" >&2
+      exit 5
+    fi
+  fi
   echo "USING_EXISTING_ADVANCED_RELAY $(sha256sum "$ADV" | awk '{print $1}')"
 fi
 

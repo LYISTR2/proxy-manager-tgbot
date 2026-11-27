@@ -117,11 +117,16 @@ PORTPY
 # 打印 CREATED/WRITTEN/APPENDED/SKIP_EXISTING（不回显密码）。非 0 表示失败。
 ensure_ss_inbound() {
   local role="$1" port="$2" password="$3"
-  python3 - "$role" "$SINGBOX_DIR" "$port" "$password" <<'INBPY'
+  # 密码走环境变量而不是 argv：命令行参数对同机任意用户 ps 可见。
+  # 环境变量只有同 uid 或 root 能从 /proc/<pid>/environ 读到。
+  _SB_SS_PASS="$password" python3 - "$role" "$SINGBOX_DIR" "$port" <<'INBPY'
 import json, os, sys
 
-role, conf_dir, port_s, password = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+role, conf_dir, port_s = sys.argv[1], sys.argv[2], sys.argv[3]
 port = int(port_s)
+password = os.environ.get("_SB_SS_PASS", "")
+if not password:
+    sys.exit("缺少 SS2022 密码")
 
 def load(path):
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
@@ -603,14 +608,46 @@ ensure_singbox() {
     *) echo "不支持的 CPU 架构：$arch，请手动安装 /usr/local/bin/sing-box。" >&2; return 1 ;;
   esac
   ver=${SBRELAY_SINGBOX_VERSION:-}
+  local want_sha="${SBRELAY_SINGBOX_SHA256:-}"
   if [ -z "$ver" ]; then
     ver=$(curl -fsSL --max-time 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null \
       | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))' 2>/dev/null || true)
   fi
-  ver=${ver:-1.11.4}
+  ver=${ver:-}
+  if [ -z "$ver" ]; then
+    echo "获取 sing-box 最新版本失败，且未指定 SBRELAY_SINGBOX_VERSION。" >&2
+    echo "请手动安装 /usr/local/bin/sing-box，或显式指定版本与 SBRELAY_SINGBOX_SHA256 后重试。" >&2
+    return 1
+  fi
   url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${sb_arch}.tar.gz"
   tgz="$WORKDIR/sing-box.tar.gz"
+  # 校验压缩包：优先用环境变量给的摘要，否则从 GitHub release 元数据里取同名 asset 的 digest。
+  if [ -z "$want_sha" ]; then
+    want_sha=$(curl -fsSL --max-time 20 "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${ver}" 2>/dev/null \
+      | python3 -c '
+import json, sys
+want = "sing-box-" + sys.argv[1] + "-linux-" + sys.argv[2] + ".tar.gz"
+for a in json.load(sys.stdin).get("assets") or []:
+    if a.get("name") == want:
+        d = (a.get("digest") or "").strip()
+        if d.startswith("sha256:"):
+            print(d[7:])
+        break
+' "$ver" "$sb_arch" 2>/dev/null || true)
+  fi
+  if ! printf '%s' "$want_sha" | grep -Eq '^[0-9a-f]{64}$'; then
+    echo "无法获得 sing-box ${ver} 的 SHA256，拒绝安装未校验的二进制。" >&2
+    echo "请设置 SBRELAY_SINGBOX_SHA256=<64 位小写 hex> 后重试。" >&2
+    return 1
+  fi
   curl -fL --connect-timeout 20 --max-time 180 "$url" -o "$tgz"
+  local got_sha
+  got_sha=$(sha256sum "$tgz" | awk '{print $1}')
+  if [ "$got_sha" != "$want_sha" ]; then
+    echo "sing-box 压缩包校验失败（期望 $want_sha，实际 $got_sha），已中止。" >&2
+    rm -f "$tgz"
+    return 1
+  fi
   tar -xzf "$tgz" -C "$WORKDIR"
   local bin
   bin=$(find "$WORKDIR" -maxdepth 2 -type f -name sing-box | head -n1)

@@ -27,7 +27,15 @@ ROLE=""; URL=""; PIN=""; PUBKEY=""; ACTION=install
 DRY_RUN=0; NO_DEPS=0; NO_GO_DOWNLOAD=0
 LISTEN=""; PUBLIC_URL=""
 
-usage() { sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; cat <<'U'
+usage() { cat <<'U'
+sbrelay 一键安装入口。可直接远程运行（自动下载仓库源码到临时目录，用完即删），也可在仓库目录运行：
+  bash <(curl -fsSL https://raw.githubusercontent.com/LYISTR2/proxy-manager-tgbot/main/install.sh) [参数]
+  sudo bash install.sh                         交互选择：控制端 / 线路机 / 落地机 / 状态 / 卸载
+  sudo bash install.sh --role control          安装 / 更新控制端（Bot token 不回显输入，或用环境变量 SBRELAY_TG_TOKEN）
+  sudo bash install.sh --role relay|landing    安装 agent：粘贴面板给的安装命令（不回显）
+  sudo bash install.sh --role relay --url https://控制端:8443 --pin <证书指纹> [--pubkey sha256//...]
+                                               令牌按提示不回显输入；或在 root shell 里先 export SBRELAY_TOKEN
+  sudo bash install.sh --status | --uninstall | --purge
 
 参数：
   --role control|relay|landing   要装的角色
@@ -61,13 +69,13 @@ die() { printf '%s\n' "$1" >&2; exit "${2:-1}"; }
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --role) ROLE="${2:-}"; shift 2 ;;
+      --role) [ -n "${2:-}" ] || die "--role 缺少取值（control / relay / landing）。" 2; ROLE="$2"; shift 2 ;;
       --role=*) ROLE="${1#*=}"; shift ;;
-      --url) URL="${2:-}"; shift 2 ;;
-      --pin) PIN="${2:-}"; shift 2 ;;
-      --pubkey|--pinnedpubkey) PUBKEY="${2:-}"; shift 2 ;;
-      --listen) LISTEN="${2:-}"; shift 2 ;;
-      --public-url) PUBLIC_URL="${2:-}"; shift 2 ;;
+      --url) [ -n "${2:-}" ] || die "--url 缺少取值（控制端地址，如 https://主机:8443）。" 2; URL="$2"; shift 2 ;;
+      --pin) [ -n "${2:-}" ] || die "--pin 缺少取值（证书指纹）。" 2; PIN="$2"; shift 2 ;;
+      --pubkey|--pinnedpubkey) [ -n "${2:-}" ] || die "$1 缺少取值（sha256//... 公钥指纹）。" 2; PUBKEY="$2"; shift 2 ;;
+      --listen) [ -n "${2:-}" ] || die "--listen 缺少取值（如 0.0.0.0:8443）。" 2; LISTEN="$2"; shift 2 ;;
+      --public-url) [ -n "${2:-}" ] || die "--public-url 缺少取值。" 2; PUBLIC_URL="$2"; shift 2 ;;
       --status) ACTION=status; shift ;;
       --uninstall) ACTION=uninstall; shift ;;
       --purge) ACTION=purge; shift ;;
@@ -115,7 +123,7 @@ missing_deps() {
   for c in systemctl curl openssl python3 tar sha256sum; do
     command -v "$c" >/dev/null 2>&1 || miss+=("$c")
   done
-  printf '%s\n' "${miss[@]}"
+  [ "${#miss[@]}" -gt 0 ] && printf '%s\n' "${miss[@]}"
 }
 
 ensure_deps() {

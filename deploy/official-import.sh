@@ -2,12 +2,23 @@
 # 在线路机以 root 运行：按 sb 菜单 [18] 的方式准备 official advanced_relay.sh，再调用其 _relay_config。
 # 用法：official-import.sh /root/sbrelay-backups/enc2-....env <listen_port> <node_name>
 set -euo pipefail
+if [ $# -lt 3 ]; then
+  echo "用法：$0 <token_file> <listen_port> <node_name>" >&2
+  exit 2
+fi
 TOKEN_FILE=$1
 LISTEN_PORT=$2
 NODE_NAME=$3
 ENTRANCE_CHOICE=${ENTRANCE_CHOICE:-7}
 RELAY_IP=${RELAY_IP:-}
 if [ "$(id -u)" -ne 0 ]; then echo "请用 root 运行" >&2; exit 1; fi
+if [ ! -f "$TOKEN_FILE" ]; then echo "找不到 token 文件：$TOKEN_FILE" >&2; exit 2; fi
+if [[ ! "$LISTEN_PORT" =~ ^[0-9]+$ ]] || [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
+  echo "监听端口不合法：$LISTEN_PORT（需要 1-65535 整数）" >&2
+  exit 2
+fi
+TMP_ADV=""
+trap '[ -n "${TMP_ADV:-}" ] && rm -f -- "$TMP_ADV"' EXIT
 TOKEN=$(awk -F= '$1=="TOKEN"{print substr($0,index($0,"=")+1)}' "$TOKEN_FILE")
 PASS=$(awk -F= '$1=="PASS"{print substr($0,index($0,"=")+1)}' "$TOKEN_FILE")
 if [ -z "$TOKEN" ] || [ -z "$PASS" ]; then echo "token 文件缺字段" >&2; exit 1; fi
@@ -22,11 +33,13 @@ URL=https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/advanced_rela
 ADV_SHA=${SBRELAY_ADV_SHA256:-}
 if [ ! -s "$ADV" ]; then
   tmp=$(mktemp)
+  TMP_ADV="$tmp"
   curl -fsSL --max-time 30 "$URL" -o "$tmp"
   bash -n "$tmp"
   got=$(sha256sum "$tmp" | awk '{print $1}')
   if [ -z "$ADV_SHA" ]; then
     rm -f "$tmp"
+    TMP_ADV=""
     echo "STOP: 需要先固定 advanced_relay.sh 的内容摘要。" >&2
     echo "本次拉取到的 SHA256=$got" >&2
     echo "核对来源后，用 SBRELAY_ADV_SHA256=$got 重跑本脚本。" >&2
@@ -34,11 +47,13 @@ if [ ! -s "$ADV" ]; then
   fi
   if [ "$got" != "$ADV_SHA" ]; then
     rm -f "$tmp"
+    TMP_ADV=""
     echo "STOP: advanced_relay.sh 摘要不符（期望 $ADV_SHA，实际 $got），已丢弃。" >&2
     exit 5
   fi
   chmod 755 "$tmp"
   mv -f "$tmp" "$ADV"
+  TMP_ADV=""
   echo "DOWNLOADED_ADVANCED_RELAY $got"
 else
   if [ -n "$ADV_SHA" ]; then
@@ -51,6 +66,7 @@ else
   echo "USING_EXISTING_ADVANCED_RELAY $(sha256sum "$ADV" | awk '{print $1}')"
 fi
 
+mkdir -p /root/sbrelay-backups
 LOG=/root/sbrelay-backups/import-${LISTEN_PORT}.log
 umask 077
 set +e
@@ -122,4 +138,4 @@ if ! jq -e --arg p "$LISTEN_PORT" '.outbounds[]? | select(.tag==("relay-out-"+$p
   exit 4
 fi
 echo "IMPORT_OK port=$LISTEN_PORT name=$NODE_NAME"
-echo "SERVICE=$(systemctl is-active sing-box)"
+echo "SERVICE=$(systemctl is-active sing-box || true)"

@@ -128,7 +128,8 @@ self_install() {
 
 # 证书指纹（hex，证书 DER 的 SHA-256）校验通过后，返回 curl 用的公钥指纹 sha256//...
 spki_from_pin() {
-  local url=$1 pin=$2 host port conn_host certpem got
+  local url=$1 pin=${2,,} host port conn_host certpem got
+  local -a _hp=()
   mapfile -t _hp < <(python3 - "$url" <<'PY'
 import sys, urllib.parse
 u = urllib.parse.urlsplit(sys.argv[1])
@@ -360,7 +361,7 @@ agent_install() {
   ask "请选择" 1
   m=$REPLY
   if [ "$m" = 2 ]; then
-    ask "控制端地址（https://主机:端口）" ""; url=${REPLY%/}
+    ask "控制端地址（https://主机:端口）" ""; url=$(printf '%s' "$REPLY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'); url=${url%/}
     echo "请输入安装令牌（不回显）："
     if { : >/dev/tty; } 2>/dev/null; then
       IFS= read -rs P_TOK </dev/tty || true
@@ -368,8 +369,8 @@ agent_install() {
       IFS= read -rs P_TOK || true
     fi
     echo
-    ask "证书指纹（64 位十六进制，--pin 后面那串）" ""; pin=${REPLY,,}
-    ask "公钥指纹（sha256//...，可留空，会按证书指纹自动校验得出）" ""; pk=$REPLY
+    ask "证书指纹（64 位十六进制，--pin 后面那串）" ""; pin=$(printf '%s' "${REPLY,,}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    ask "公钥指纹（sha256//...，可留空，会按证书指纹自动校验得出）" ""; pk=$(printf '%s' "$REPLY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   else
     echo "请粘贴面板里以 curl 开头的那一行（不回显，粘贴后回车）："
     if { : >/dev/tty; } 2>/dev/null; then
@@ -395,7 +396,11 @@ agent_install() {
   ensure_tmpdir || true
   script=$(get_agent_script "$url" "$pk") || { err "下载 install-agent.sh 失败。"; P_TOK=""; return 1; }
   # 令牌只经环境变量交给安装脚本，不出现在进程参数里
-  SBRELAY_TOKEN="$P_TOK" bash "$script" $force_flag --url "$url" --pin "$pin" --pubkey "$pk" --role "$role"
+  if [ -n "$force_flag" ]; then
+    SBRELAY_TOKEN="$P_TOK" bash "$script" "$force_flag" --url "$url" --pin "$pin" --pubkey "$pk" --role "$role"
+  else
+    SBRELAY_TOKEN="$P_TOK" bash "$script" --url "$url" --pin "$pin" --pubkey "$pk" --role "$role"
+  fi
   local rc=$?
   P_TOK=""
   return $rc
@@ -550,13 +555,15 @@ run_choice() {
 }
 
 main() {
+  case "${1:-}" in
+    -h|--help) sed -n '2,10p' "$SELF"; exit 0 ;;
+  esac
   need_root
   for c in systemctl curl openssl python3; do
     command -v "$c" >/dev/null || { err "缺少命令 $c，请先安装。"; exit 1; }
   done
   self_install
   case "${1:-}" in
-    -h|--help) sed -n '2,10p' "$SELF"; exit 0 ;;
     status) show_status; exit 0 ;;
     restart) restart_services; exit 0 ;;
     [0-6]) run_choice "$1"; exit $? ;;

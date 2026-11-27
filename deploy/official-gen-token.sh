@@ -7,7 +7,7 @@ OUTDIR=${OUTDIR:-/root/sbrelay-backups}
 TAG=${TAG:-SS-aes128-in-8888}
 umask 077
 mkdir -p "$OUTDIR"
-node=$(jq -c --arg t "$TAG" '.inbounds[] | select(.tag==$t)' "$CFG")
+node=$(jq -c --arg t "$TAG" '.inbounds[]? | select(.tag==$t)' "$CFG")
 if [ -z "$node" ]; then echo "找不到入站 $TAG" >&2; exit 1; fi
 port=$(printf '%s' "$node" | jq -r '.listen_port')
 method=$(printf '%s' "$node" | jq -r '.method')
@@ -48,6 +48,7 @@ fi
 if [ -z "$token_addr" ]; then
   token_addr=$(curl -fsS --max-time 8 https://api.ipify.org || true)
 fi
+token_addr=$(printf '%s' "$token_addr" | tr -d '[:space:]')
 if [ -z "$token_addr" ]; then echo "无法确定落地公网地址" >&2; exit 1; fi
 # 只允许 IPv4 / IPv6 / 普通主机名，长度上限防止把错误文本写进去
 python3 - "$token_addr" <<'PY'

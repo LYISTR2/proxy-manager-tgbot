@@ -48,13 +48,25 @@ PARSE_ONLY=0
 FORCE_REGISTER=0
 SETUP_ONLY=0
 
+WORKDIR=""
+CFG_BAK_DIR=""
+cleanup() {
+  if [ -n "${WORKDIR:-}" ]; then rm -rf -- "$WORKDIR"; fi
+  if [ -n "${CFG_BAK_DIR:-}" ]; then rm -rf -- "$CFG_BAK_DIR"; fi
+  WORKDIR=""; CFG_BAK_DIR=""
+  return 0
+}
+trap cleanup EXIT
+trap 'trap - INT; cleanup; exit 130' INT
+trap 'trap - TERM; cleanup; exit 143' TERM
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --url) URL="${2:-}"; shift 2 ;;
-    --pin) PIN="${2:-}"; shift 2 ;;
-    --pubkey|--pinnedpubkey) PUBKEY="${2:-}"; shift 2 ;;
-    --token) TOKEN="${2:-}"; shift 2 ;;
-    --role) ROLE="${2:-}"; shift 2 ;;
+    --url) [ -n "${2:-}" ] || { echo "--url 缺少取值。" >&2; exit 2; }; URL="$2"; shift 2 ;;
+    --pin) [ -n "${2:-}" ] || { echo "--pin 缺少取值（证书指纹）。" >&2; exit 2; }; PIN="$2"; shift 2 ;;
+    --pubkey|--pinnedpubkey) [ -n "${2:-}" ] || { echo "$1 缺少取值。" >&2; exit 2; }; PUBKEY="$2"; shift 2 ;;
+    --token) [ -n "${2:-}" ] || { echo "--token 缺少取值。" >&2; exit 2; }; TOKEN="$2"; shift 2 ;;
+    --role) [ -n "${2:-}" ] || { echo "--role 缺少取值（relay / landing）。" >&2; exit 2; }; ROLE="$2"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) UNINSTALL=1; PURGE=1; shift ;;
     --update) shift ;;
@@ -94,6 +106,10 @@ SINGBOX_BIN=${SBRELAY_SINGBOX_BIN:-/usr/local/bin/sing-box}
 
 pick_free_port() {
   if [ -n "${SBRELAY_SS_PORT:-}" ]; then
+    if [[ ! "$SBRELAY_SS_PORT" =~ ^[0-9]+$ ]] || [ "$SBRELAY_SS_PORT" -lt 1 ] || [ "$SBRELAY_SS_PORT" -gt 65535 ]; then
+      echo "SBRELAY_SS_PORT 不合法：$SBRELAY_SS_PORT（需要 1-65535 整数）。" >&2
+      return 1
+    fi
     echo "$SBRELAY_SS_PORT"
     return 0
   fi
@@ -101,14 +117,20 @@ pick_free_port() {
 import random, socket
 for _ in range(50):
     p = random.randint(20000, 59999)
-    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    try:
-        s.bind(("::", p))
-        s.close()
-        print(p)
-        raise SystemExit(0)
-    except OSError:
-        s.close()
+    for fam, addr in ((socket.AF_INET6, ("::", p)), (socket.AF_INET, ("0.0.0.0", p))):
+        s = None
+        try:
+            s = socket.socket(fam, socket.SOCK_STREAM)
+            s.bind(addr)
+            s.close()
+            print(p)
+            raise SystemExit(0)
+        except OSError:
+            if s is not None:
+                s.close()
+            if fam == socket.AF_INET6:
+                continue
+        break
 print(random.randint(20000, 59999))
 PORTPY
 }
@@ -123,7 +145,12 @@ ensure_ss_inbound() {
 import json, os, sys
 
 role, conf_dir, port_s = sys.argv[1], sys.argv[2], sys.argv[3]
-port = int(port_s)
+try:
+    port = int(port_s)
+except ValueError:
+    sys.exit("无效端口：" + port_s)
+if not (1 <= port <= 65535):
+    sys.exit("端口超出范围（1-65535）：" + port_s)
 password = os.environ.get("_SB_SS_PASS", "")
 if not password:
     sys.exit("缺少 SS2022 密码")
@@ -244,6 +271,7 @@ setup_singbox_node() {
     local f=$1
     if [ -z "$bak_dir" ]; then
       bak_dir=$(mktemp -d /tmp/sbrelay-cfgbak-XXXXXX)
+      CFG_BAK_DIR="$bak_dir"
     fi
     if [ -e "$SINGBOX_DIR/$f" ]; then
       cp -a "$SINGBOX_DIR/$f" "$bak_dir/$f"
@@ -303,7 +331,7 @@ CFG
     else
       pass=$(openssl rand -base64 16)
     fi
-    action=$(ensure_ss_inbound relay "$port" "$pass")
+    action=$(ensure_ss_inbound relay "$port" "$pass") || action=FAILED
     unset pass
     case "$action" in
       CREATED|WRITTEN)
@@ -311,7 +339,8 @@ CFG
         need_restart=1
         if ! run_check; then
           rollback_cfg
-          rm -rf "$bak_dir"
+          [ -n "$bak_dir" ] && rm -rf -- "$bak_dir"
+          bak_dir=""; CFG_BAK_DIR=""
           return 1
         fi
         restrict_secret_file "$SINGBOX_DIR/relay.json"
@@ -322,11 +351,13 @@ CFG
       *)
         echo "写入线路机入站失败。" >&2
         rollback_cfg
-        rm -rf "$bak_dir"
+        [ -n "$bak_dir" ] && rm -rf -- "$bak_dir"
+        bak_dir=""; CFG_BAK_DIR=""
         return 1
         ;;
     esac
-    rm -rf "$bak_dir"
+    [ -n "$bak_dir" ] && rm -rf -- "$bak_dir"
+    bak_dir=""; CFG_BAK_DIR=""
     if [ "$SETUP_ONLY" != 1 ] && [ ! -f /etc/systemd/system/sing-box.service ]; then
       cat > /etc/systemd/system/sing-box.service <<'SBUNIT'
 [Unit]
@@ -355,7 +386,7 @@ SBUNIT
     else
       pass=$(openssl rand -base64 16)
     fi
-    action=$(ensure_ss_inbound landing "$port" "$pass")
+    action=$(ensure_ss_inbound landing "$port" "$pass") || action=FAILED
     unset pass
     case "$action" in
       CREATED)
@@ -363,7 +394,8 @@ SBUNIT
         need_restart=1
         if ! run_check; then
           rollback_cfg
-          rm -rf "$bak_dir"
+          [ -n "$bak_dir" ] && rm -rf -- "$bak_dir"
+          bak_dir=""; CFG_BAK_DIR=""
           return 1
         fi
         restrict_secret_file "$SINGBOX_DIR/config.json"
@@ -373,7 +405,8 @@ SBUNIT
         need_restart=1
         if ! run_check; then
           rollback_cfg
-          rm -rf "$bak_dir"
+          [ -n "$bak_dir" ] && rm -rf -- "$bak_dir"
+          bak_dir=""; CFG_BAK_DIR=""
           return 1
         fi
         restrict_secret_file "$SINGBOX_DIR/config.json"
@@ -384,11 +417,13 @@ SBUNIT
       *)
         echo "写入落地机入站失败。" >&2
         rollback_cfg
-        rm -rf "$bak_dir"
+        [ -n "$bak_dir" ] && rm -rf -- "$bak_dir"
+        bak_dir=""; CFG_BAK_DIR=""
         return 1
         ;;
     esac
-    rm -rf "$bak_dir"
+    [ -n "$bak_dir" ] && rm -rf -- "$bak_dir"
+    bak_dir=""; CFG_BAK_DIR=""
     if [ "$SETUP_ONLY" != 1 ] && [ ! -f /etc/systemd/system/sing-box.service ]; then
       cat > /etc/systemd/system/sing-box.service <<'SBUNIT'
 [Unit]
@@ -556,7 +591,10 @@ if [ -z "$PUBKEY" ]; then
   conn_host="$host"
   case "$host" in *:*) conn_host="[$host]" ;; esac
   certpem=$(timeout 20 openssl s_client -connect "$conn_host:$port" -servername "$host" </dev/null 2>/dev/null | openssl x509 2>/dev/null || true)
-  got=$(printf '%s\n' "$certpem" | openssl x509 -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+  got=""
+  if [ -n "$certpem" ]; then
+    got=$(printf '%s\n' "$certpem" | openssl x509 -outform DER 2>/dev/null | sha256sum | awk '{print $1}' || true)
+  fi
   if [ -z "$certpem" ] || [ "$got" != "$PIN" ]; then
     echo "无法取得控制端证书，或证书指纹不一致，已中止。" >&2
     exit 2
@@ -577,8 +615,6 @@ curl_pin() {
 
 WORKDIR=$(mktemp -d /tmp/sbrelay-agent-XXXXXX)
 chmod 700 "$WORKDIR"
-cleanup() { rm -rf "$WORKDIR"; }
-trap cleanup EXIT
 
 echo "正在从控制端下载 agent 二进制（已启用公钥指纹校验）..."
 curl_pin "$WORKDIR/sbrelay" "$URL/pkg/sbrelay"
@@ -650,13 +686,13 @@ for a in json.load(sys.stdin).get("assets") or []:
   fi
   tar -xzf "$tgz" -C "$WORKDIR"
   local bin
-  bin=$(find "$WORKDIR" -maxdepth 2 -type f -name sing-box | head -n1)
+  bin=$(find "$WORKDIR" -maxdepth 2 -type f -name sing-box | awk 'NR==1{print}')
   if [ -z "$bin" ]; then
     echo "解压 sing-box 失败。" >&2
     return 1
   fi
   install -o root -g root -m 0755 "$bin" /usr/local/bin/sing-box
-  echo "已安装 sing-box：$(/usr/local/bin/sing-box version | head -n1)"
+  echo "已安装 sing-box：$(/usr/local/bin/sing-box version | awk 'NR==1{print}')"
 }
 
 detect_public_ip() {
@@ -674,7 +710,7 @@ detect_public_ip() {
     done
   fi
   if [ -z "$ip" ]; then
-    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
   fi
   printf '%s' "$ip"
 }

@@ -43,10 +43,14 @@ UNIT=/etc/systemd/system/sbrelay-control.service
 BUILD_TMP=""
 TMPENV=""
 cleanup() {
-  [ -n "$BUILD_TMP" ] && rm -rf "$BUILD_TMP"
-  [ -n "$TMPENV" ] && rm -f "$TMPENV"
+  if [ -n "$BUILD_TMP" ]; then rm -rf -- "$BUILD_TMP"; fi
+  if [ -n "$TMPENV" ]; then rm -f -- "$TMPENV"; fi
+  BUILD_TMP=""; TMPENV=""
+  return 0
 }
 trap cleanup EXIT
+trap 'trap - INT; cleanup; exit 130' INT
+trap 'trap - TERM; cleanup; exit 143' TERM
 
 MODE=install
 PURGE=0
@@ -75,8 +79,8 @@ install_file() {
 # 把 token 原子写进 control.env。校验失败返回非 0，调用方必须检查。
 # token 经环境变量传给 python：不走 argv（ps 可见），也不走管道（避免提示语混入）。
 write_token_to_env_file() {
-  local rc=0
-  _SB_TOK="$1" python3 -c '
+  local tok_val="$1" target="${2:-$ENV_FILE}" rc=0
+  _SB_TOK="$tok_val" python3 -c '
 import os, sys, tempfile
 path = sys.argv[1]
 tok = os.environ.get("_SB_TOK", "").strip()
@@ -97,10 +101,12 @@ with os.fdopen(fd, "w") as f:
     f.write("\n".join(lines) + "\n")
 os.chmod(tmp, 0o640)
 os.replace(tmp, path)
-' "$ENV_FILE" || rc=$?
+' "$target" || rc=$?
   [ "$rc" = 0 ] || return "$rc"
-  chown root:sbrelayctl "$ENV_FILE" 2>/dev/null || true
-  chmod 640 "$ENV_FILE"
+  if [ "$target" = "$ENV_FILE" ]; then
+    chown root:sbrelayctl "$ENV_FILE" 2>/dev/null || true
+    chmod 640 "$ENV_FILE"
+  fi
 }
 
 # 从终端读取 token，结果放进 REPLY_TOK。
@@ -242,9 +248,15 @@ case "$LISTEN" in
   *) LISTEN="0.0.0.0:$LISTEN" ;;
 esac
 
+LISTEN_PORT="${LISTEN##*:}"
+if [[ "$LISTEN" != *:* ]] || [[ ! "$LISTEN_PORT" =~ ^[0-9]+$ ]] || [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
+  echo "监听地址不合法：$LISTEN（需要 主机:端口，端口范围 1-65535）。" >&2
+  exit 2
+fi
+
 HOST=${SBRELAY_CERT_HOST:-}
 if [ -z "$HOST" ]; then
-  HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
+  HOST=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
 fi
 HOST=${HOST:-127.0.0.1}
 URL_HOST="$HOST"
@@ -317,12 +329,9 @@ TMPENV=$(mktemp /tmp/sbrelay-control-env-XXXXXX)
 } > "$TMPENV"
 OLD_TOKEN_LINE=0
 if [ "$HAVE_TOKEN" = 1 ] && [ "${SBRELAY_OVERWRITE_TOKEN:-}" != 1 ]; then
-  grep '^SBRELAY_TG_TOKEN=' "$ENV_FILE" | head -n1 >> "$TMPENV"
+  grep -m1 '^SBRELAY_TG_TOKEN=' "$ENV_FILE" >> "$TMPENV"
   OLD_TOKEN_LINE=1
 fi
-install -o root -g sbrelayctl -m 0640 "$TMPENV" "$ENV_FILE"
-rm -f "$TMPENV"
-TMPENV=""
 if [ "$OLD_TOKEN_LINE" != 1 ]; then
   if [ -n "${SBRELAY_TG_TOKEN:-}" ]; then
     NEW_TOK=$SBRELAY_TG_TOKEN
@@ -333,9 +342,12 @@ if [ "$OLD_TOKEN_LINE" != 1 ]; then
     echo "用法：SBRELAY_TG_TOKEN=xxx bash $0   （或在终端里直接运行，会提示输入）" >&2
     exit 1
   fi
-  write_token_to_env_file "$NEW_TOK"
+  write_token_to_env_file "$NEW_TOK" "$TMPENV"
   NEW_TOK=""; REPLY_TOK=""
 fi
+install -o root -g sbrelayctl -m 0640 "$TMPENV" "$ENV_FILE"
+rm -f "$TMPENV"
+TMPENV=""
 unset SBRELAY_TG_TOKEN
 
 UNIT_SRC=${UNIT_SRC:-$SCRIPT_DIR/sbrelay-control.service}

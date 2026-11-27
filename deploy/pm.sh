@@ -362,12 +362,22 @@ agent_install() {
   if [ "$m" = 2 ]; then
     ask "控制端地址（https://主机:端口）" ""; url=${REPLY%/}
     echo "请输入安装令牌（不回显）："
-    IFS= read -rs P_TOK || true; echo
+    if { : >/dev/tty; } 2>/dev/null; then
+      IFS= read -rs P_TOK </dev/tty || true
+    else
+      IFS= read -rs P_TOK || true
+    fi
+    echo
     ask "证书指纹（64 位十六进制，--pin 后面那串）" ""; pin=${REPLY,,}
     ask "公钥指纹（sha256//...，可留空，会按证书指纹自动校验得出）" ""; pk=$REPLY
   else
     echo "请粘贴面板里以 curl 开头的那一行（不回显，粘贴后回车）："
-    IFS= read -rs line || true; echo
+    if { : >/dev/tty; } 2>/dev/null; then
+      IFS= read -rs line </dev/tty || true
+    else
+      IFS= read -rs line || true
+    fi
+    echo
     parse_panel_cmd "$line"
     line=""
     url=$P_URL; pin=$P_PIN; pk=$P_PUB

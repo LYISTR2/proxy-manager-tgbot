@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"syscall"
 	"time"
@@ -63,6 +64,8 @@ func env(k, d string) string {
 	return d
 }
 
+var publicURLRe = regexp.MustCompile(`^https://(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._-]+)(:[0-9]+)?$`)
+
 func runControl() {
 	token := os.Getenv("SBRELAY_TG_TOKEN")
 	if token == "" {
@@ -82,10 +85,14 @@ func runControl() {
 		OwnerHint: hint,
 		PkgDir:    env("SBRELAY_PKG_DIR", "/usr/local/lib/sbrelay"),
 	}
+	if !publicURLRe.MatchString(cfg.PublicURL) {
+		log.Fatalf("SBRELAY_PUBLIC_URL 格式不合法（必须为 https://主机[:端口]）: %q", cfg.PublicURL)
+	}
 	b, err := tgbot.New(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer b.Store().Close()
 	if pin, spki, err := tlspin.FromKeyPair(cfg.CertFile, cfg.KeyFile); err != nil {
 		log.Fatalf("加载 TLS 证书失败: %v", err)
 	} else {
@@ -188,6 +195,7 @@ func issueToken() error {
 	if err != nil {
 		return err
 	}
+	defer st.Close()
 	tok, err := st.NewInstallToken(name, role, 2*time.Hour)
 	if err != nil {
 		return err

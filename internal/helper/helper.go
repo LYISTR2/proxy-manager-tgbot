@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -343,7 +344,9 @@ func (e *Env) switchLocked(req SwitchReq, res Result) Result {
 		last.RolledBack = true
 	}
 	lb, _ := json.Marshal(last)
-	_ = os.WriteFile(filepath.Join(e.StateDir, "last.json"), lb, 0600)
+	if err := writeAtomic(filepath.Join(e.StateDir, "last.json"), lb); err != nil {
+		log.Printf("写入 last.json 失败: %v", err)
+	}
 	st, _ := e.parseCurrentStatus()
 	res.OK, res.Service, res.Last, res.Status = true, e.serviceState(), &last, st
 	return res

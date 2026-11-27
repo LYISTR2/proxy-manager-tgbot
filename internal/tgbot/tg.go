@@ -54,6 +54,7 @@ type Bot struct {
 	nonceSeen map[string]int64                // machineID+nonce -> 过期 unix，防重放
 	inFlight  map[string]bool                 // machineID -> 正在执行远程操作，防并发连点
 	notified  map[string]bool                 // machineID -> 已推送过自动搭建的 SS2022 节点通知
+	regFails  map[string][]time.Time          // client IP -> 最近 1 分钟注册失败时间戳，用于限流
 }
 
 func New(cfg Config) (*Bot, error) {
@@ -609,6 +610,7 @@ func (b *Bot) askWithSpec(machine, op, inbound, outbound string, spec *relaycfg.
 	case r := <-ch:
 		return r, nil
 	case <-time.After(timeout):
+		_ = b.st.Cancel(cmd.ID)
 		return nil, fmt.Errorf("agent 未在 %s 内响应（可能离线）", timeout)
 	}
 }
@@ -621,6 +623,19 @@ func (b *Bot) allowed(uid int64) bool {
 	return uid == o
 }
 
+// isStartCmd 统一判断 /start 与 /start@botname（可带参数），拒绝 /startxyz 等前缀误匹配。
+func isStartCmd(text string) bool {
+	cmd, _, _ := strings.Cut(strings.TrimSpace(text), " ")
+	cmd = strings.ToLower(cmd)
+	if cmd == "/start" {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(cmd, "/start@"); ok && rest != "" {
+		return true
+	}
+	return false
+}
+
 func (b *Bot) handleMsg(m *Message) {
 	if m.From == nil || m.Chat == nil {
 		return
@@ -630,7 +645,7 @@ func (b *Bot) handleMsg(m *Message) {
 	cmd, arg, _ := strings.Cut(text, " ")
 	cmd = strings.ToLower(cmd)
 
-	if cmd == "/start" {
+	if isStartCmd(text) {
 		b.clearExpect(uid)
 		if b.st.Owner() == 0 {
 			if err := b.st.SetOwner(uid); err != nil {
@@ -1003,6 +1018,18 @@ func formatResult(op string, raw json.RawMessage) string {
 
 // ---------- 更新循环 ----------
 
+// safeGo 在独立 goroutine 中运行回调并兜底 recover，避免单条异常消息导致控制端整体退出。
+func (b *Bot) safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("处理 %s 发生 panic（已恢复）: %v", name, r)
+			}
+		}()
+		fn()
+	}()
+}
+
 func (b *Bot) PollTG(ctx context.Context) {
 	var offset int64
 	for {
@@ -1025,10 +1052,10 @@ func (b *Bot) PollTG(ctx context.Context) {
 			offset = u.ID + 1
 			u := u
 			if u.Message != nil {
-				go b.handleMsg(u.Message)
+				b.safeGo("message", func() { b.handleMsg(u.Message) })
 			}
 			if u.CB != nil {
-				go b.handleCB(u.CB)
+				b.safeGo("callback", func() { b.handleCB(u.CB) })
 			}
 		}
 	}
@@ -1046,7 +1073,7 @@ func (b *Bot) PeekOwner() int64 {
 	var ups []Update
 	json.Unmarshal(raw, &ups)
 	for _, u := range ups {
-		if u.Message != nil && u.Message.From != nil && strings.HasPrefix(strings.TrimSpace(u.Message.Text), "/start") {
+		if u.Message != nil && u.Message.From != nil && isStartCmd(u.Message.Text) {
 			_ = b.st.SetOwner(u.Message.From.ID)
 			return u.Message.From.ID
 		}
@@ -1092,21 +1119,78 @@ func (b *Bot) AgentMux() http.Handler {
 	return mux
 }
 
+const (
+	regFailLimit  = 5
+	regFailWindow = time.Minute
+)
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+func (b *Bot) pruneRegFailsLocked(cutoff time.Time) {
+	for ip, ts := range b.regFails {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(b.regFails, ip)
+		} else {
+			b.regFails[ip] = kept
+		}
+	}
+}
+
+func (b *Bot) allowRegister(ip string, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.regFails == nil {
+		return true
+	}
+	b.pruneRegFailsLocked(now.Add(-regFailWindow))
+	return len(b.regFails[ip]) < regFailLimit
+}
+
+func (b *Bot) recordRegisterFail(ip string, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.regFails == nil {
+		b.regFails = map[string][]time.Time{}
+	}
+	b.pruneRegFailsLocked(now.Add(-regFailWindow))
+	b.regFails[ip] = append(b.regFails[ip], now)
+}
+
 func (b *Bot) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method", 405)
+		return
+	}
+	ip := clientIP(r)
+	now := time.Now()
+	if !b.allowRegister(ip, now) {
+		http.Error(w, "too many failed register attempts", http.StatusTooManyRequests)
 		return
 	}
 	var req struct {
 		Token string `json:"token"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		b.recordRegisterFail(ip, now)
 		http.Error(w, "bad json", 400)
 		return
 	}
 	mid, secret := store.RandHex(8), store.RandHex(32)
 	m, err := b.st.ConsumeToken(req.Token, mid, secret)
 	if err != nil {
+		b.recordRegisterFail(ip, now)
 		http.Error(w, err.Error(), 403)
 		return
 	}
@@ -1228,7 +1312,15 @@ func (b *Bot) RunControl(ctx context.Context) error {
 	if b.cfg.Listen == "" {
 		return fmt.Errorf("未设置监听地址")
 	}
-	srv := &http.Server{Addr: b.cfg.Listen, Handler: b.AgentMux(), BaseContext: func(net.Listener) context.Context { return ctx }}
+	srv := &http.Server{
+		Addr:              b.cfg.Listen,
+		Handler:           b.AgentMux(),
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go b.PollTG(ctx)
 	go func() {
 		<-ctx.Done()

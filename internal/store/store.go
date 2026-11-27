@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"sbrelay/internal/relaycfg"
@@ -68,6 +70,7 @@ type State struct {
 
 type Store struct {
 	path      string
+	lockFile  *os.File
 	mu        sync.Mutex
 	s         State
 	lastFlush time.Time
@@ -78,7 +81,20 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	p := filepath.Join(dir, "state.json")
-	st := &Store{path: p, s: State{
+	lockPath := p + ".lock"
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("打开状态锁文件失败: %w", err)
+	}
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lf.Close()
+		return nil, fmt.Errorf("状态文件锁被占用（%s），请确认没有其他 sbrelay 进程正在使用同一数据目录: %w", lockPath, err)
+	}
+	unlock := func() {
+		_ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+		_ = lf.Close()
+	}
+	st := &Store{path: p, lockFile: lf, s: State{
 		Machines:     map[string]*Machine{},
 		Tokens:       map[string]*InstallToken{},
 		Commands:     map[string]*PendingCmd{},
@@ -87,6 +103,7 @@ func Open(dir string) (*Store, error) {
 	b, err := os.ReadFile(p)
 	if err == nil {
 		if err := json.Unmarshal(b, &st.s); err != nil {
+			unlock()
 			return nil, err
 		}
 		if st.s.Machines == nil {
@@ -102,9 +119,64 @@ func Open(dir string) (*Store, error) {
 			st.s.LandingNames = map[string]map[string]string{}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
+		unlock()
 		return nil, err
 	}
 	return st, nil
+}
+
+// Close 释放状态文件排他锁。
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lockFile == nil {
+		return nil
+	}
+	_ = syscall.Flock(int(s.lockFile.Fd()), syscall.LOCK_UN)
+	err := s.lockFile.Close()
+	s.lockFile = nil
+	return err
+}
+
+func cloneNodeInfo(n *relaycfg.NodeInfo) *relaycfg.NodeInfo {
+	if n == nil {
+		return nil
+	}
+	cp := *n
+	return &cp
+}
+
+func cloneMachine(m *Machine) *Machine {
+	if m == nil {
+		return nil
+	}
+	cp := *m
+	if m.LastJSON != nil {
+		cp.LastJSON = append(json.RawMessage(nil), m.LastJSON...)
+	}
+	cp.RelayNode = cloneNodeInfo(m.RelayNode)
+	cp.LandingNode = cloneNodeInfo(m.LandingNode)
+	return &cp
+}
+
+func cloneOutboundSpec(sp *relaycfg.OutboundSpec) *relaycfg.OutboundSpec {
+	if sp == nil {
+		return nil
+	}
+	cp := *sp
+	return &cp
+}
+
+func clonePendingCmd(c *PendingCmd) *PendingCmd {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	cp.OutboundSpec = cloneOutboundSpec(c.OutboundSpec)
+	if c.Result != nil {
+		cp.Result = append(json.RawMessage(nil), c.Result...)
+	}
+	return &cp
 }
 
 func (s *Store) pruneLocked(now time.Time) {
@@ -189,8 +261,9 @@ func (s *Store) ConsumeToken(token, mid, secret string) (*Machine, error) {
 			return errors.New("注册令牌无效或已过期")
 		}
 		t.Used = true
-		m = &Machine{ID: mid, Name: t.Name, Role: t.Role, Secret: secret, Created: time.Now()}
-		st.Machines[mid] = m
+		created := &Machine{ID: mid, Name: t.Name, Role: t.Role, Secret: secret, Created: time.Now()}
+		st.Machines[mid] = created
+		m = cloneMachine(created)
 		return nil
 	})
 	return m, err
@@ -199,7 +272,7 @@ func (s *Store) ConsumeToken(token, mid, secret string) (*Machine, error) {
 func (s *Store) Machine(id string) *Machine {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.s.Machines[id]
+	return cloneMachine(s.s.Machines[id])
 }
 
 func (s *Store) Enqueue(m *PendingCmd) error {
@@ -207,7 +280,7 @@ func (s *Store) Enqueue(m *PendingCmd) error {
 		m.ID = RandHex(8)
 	}
 	m.Created = time.Now()
-	return s.With(func(st *State) error { st.Commands[m.ID] = m; return nil })
+	return s.With(func(st *State) error { st.Commands[m.ID] = clonePendingCmd(m); return nil })
 }
 
 // TakeCommands 取出待下发命令；60 秒内已派发过且未完成的命令不重复派发，避免网络抖动导致重复执行。
@@ -228,7 +301,7 @@ func (s *Store) TakeCommands(machine string) []*PendingCmd {
 			continue
 		}
 		c.DispatchedAt = now
-		out = append(out, c)
+		out = append(out, clonePendingCmd(c))
 	}
 	if len(out) > 0 {
 		_ = s.save()
@@ -243,11 +316,24 @@ func (s *Store) Finish(machineID, id string, result json.RawMessage) error {
 		if c == nil {
 			return errors.New("未知命令")
 		}
-		if machineID != "" && c.Machine != machineID {
+		if machineID == "" || c.Machine != machineID {
 			return errors.New("无权提交该命令结果")
 		}
 		c.Done = true
-		c.Result = result
+		c.Result = append(json.RawMessage(nil), result...)
+		return nil
+	})
+}
+
+// Cancel 撤销尚未完成的命令（例如控制端等待超时），防止 60 秒后被重复派发。
+func (s *Store) Cancel(id string) error {
+	return s.With(func(st *State) error {
+		c := st.Commands[id]
+		if c == nil || c.Done {
+			return nil
+		}
+		c.Done = true
+		c.Result = json.RawMessage(`{"ok":false,"error":"timeout"}`)
 		return nil
 	})
 }
@@ -255,7 +341,7 @@ func (s *Store) Finish(machineID, id string, result json.RawMessage) error {
 func (s *Store) Command(id string) *PendingCmd {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.s.Commands[id]
+	return clonePendingCmd(s.s.Commands[id])
 }
 
 func (s *Store) machinesByRole(role Role) []*Machine {
@@ -264,7 +350,7 @@ func (s *Store) machinesByRole(role Role) []*Machine {
 	var out []*Machine
 	for _, m := range s.s.Machines {
 		if m != nil && m.Role == role && !m.Revoked {
-			out = append(out, m)
+			out = append(out, cloneMachine(m))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

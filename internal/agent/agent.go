@@ -3,12 +3,14 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,7 +23,10 @@ import (
 
 	"sbrelay/internal/redact"
 	"sbrelay/internal/relaycfg"
+	"sbrelay/internal/store"
 )
+
+var helperTimeout = 60 * time.Second
 
 type Config struct {
 	URL      string // https://host:8443
@@ -34,16 +39,19 @@ type Config struct {
 	Role     string
 }
 
-func (c *Config) client() *http.Client {
+func (c *Config) client() (*http.Client, error) {
 	// 自签证书：跳过系统 CA，在 TLS 握手阶段用 VerifyPeerCertificate 强制校验指纹，
 	// 确保在发送任何 HTTP 请求头/令牌前即拒绝不匹配的证书。
 	pin := strings.ToLower(strings.TrimSpace(c.TLSPin))
+	if pin == "" {
+		return nil, fmt.Errorf("未配置 TLS 指纹（SBRELAY_TLS_PIN），拒绝连接")
+	}
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if pin == "" {
-				return nil
+				return fmt.Errorf("未配置 TLS 指纹（SBRELAY_TLS_PIN），拒绝连接")
 			}
 			if len(rawCerts) == 0 {
 				return fmt.Errorf("对端未提供 TLS 证书")
@@ -56,7 +64,7 @@ func (c *Config) client() *http.Client {
 		},
 	}
 	tr := &http.Transport{TLSClientConfig: tlsCfg}
-	return &http.Client{Transport: tr, Timeout: 30 * time.Second}
+	return &http.Client{Transport: tr, Timeout: 30 * time.Second}, nil
 }
 
 func (c *Config) do(cli *http.Client, path string, body []byte) ([]byte, error) {
@@ -70,7 +78,7 @@ func (c *Config) do(cli *http.Client, path string, body []byte) ([]byte, error) 
 	req.Header.Set("Content-Type", "application/json")
 	if c.Secret != "" {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		nonce := fmt.Sprintf("%d", time.Now().UnixNano())
+		nonce := store.RandHex(8)
 		mac := hmac.New(sha256.New, []byte(c.Secret))
 		mac.Write([]byte(ts + "\n" + nonce + "\n" + string(body)))
 		req.Header.Set("X-Machine-Id", c.ID)
@@ -137,7 +145,10 @@ func (c *Config) register(cli *http.Client) error {
 }
 
 func (c *Config) helper(op string, stdin []byte) ([]byte, error) {
-	cmd := exec.Command("sudo", "-n", "--", c.Helper, op)
+	ctx, cancel := context.WithTimeout(context.Background(), helperTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sudo", "-n", "--", c.Helper, op)
+	cmd.WaitDelay = 2 * time.Second
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -147,6 +158,9 @@ func (c *Config) helper(op string, stdin []byte) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("调用 helper %s 超时（超过 %s）", op, helperTimeout)
+	}
 	out := bytes.TrimSpace(stdout.Bytes())
 	// helper 失败也返回 JSON，尽量交给控制端展示
 	if len(out) > 0 {
@@ -181,7 +195,10 @@ func Run(c Config) error {
 	if c.StateDir == "" {
 		c.StateDir = "/var/lib/sbrelay-agent"
 	}
-	cli := c.client()
+	cli, err := c.client()
+	if err != nil {
+		return err
+	}
 	if err := c.register(cli); err != nil {
 		return fmt.Errorf("注册失败: %w", err)
 	}

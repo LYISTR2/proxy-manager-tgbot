@@ -141,12 +141,28 @@ func (c *Config) helper(op string, stdin []byte) ([]byte, error) {
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
-	out, err := cmd.CombinedOutput()
+	// 只把 stdout 当 JSON：sudo 可能往 stderr 打 "unable to resolve host" 等告警，
+	// 用 CombinedOutput 会把告警拼到 JSON 前面，控制端解析失败、落地机永远不上报。
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	out := bytes.TrimSpace(stdout.Bytes())
 	// helper 失败也返回 JSON，尽量交给控制端展示
-	if err != nil && len(out) == 0 {
+	if len(out) > 0 {
+		return out, nil
+	}
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if len(msg) > 300 {
+			msg = msg[:300]
+		}
+		if msg != "" {
+			return nil, fmt.Errorf("调用 helper 失败: %v: %s", err, msg)
+		}
 		return nil, fmt.Errorf("调用 helper 失败: %v", err)
 	}
-	return out, nil
+	return nil, fmt.Errorf("helper 没有输出")
 }
 
 func (c *Config) status() []byte {

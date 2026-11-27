@@ -247,6 +247,19 @@ setup_singbox_node() {
     fi
   }
 
+  # 写进了 SS 密码的配置只给 root 读；sing-box 若以非 root 用户运行则不收紧，避免起不来。
+  restrict_secret_file() {
+    local f=$1 u=""
+    if [ "$SETUP_ONLY" != 1 ] && command -v systemctl >/dev/null 2>&1; then
+      u=$(systemctl show -p User --value sing-box 2>/dev/null || true)
+    fi
+    if [ -z "$u" ] || [ "$u" = root ]; then
+      chmod 600 "$f" 2>/dev/null || true
+    else
+      echo "提示：sing-box 以用户 $u 运行，未收紧 $f 的权限，请自行确认其他用户不可读。" >&2
+    fi
+  }
+
   run_check() {
     if [ "$role" = relay ]; then
       "$SINGBOX_BIN" check -c "$SINGBOX_DIR/config.json" -c "$SINGBOX_DIR/relay.json"
@@ -296,6 +309,7 @@ CFG
           rm -rf "$bak_dir"
           return 1
         fi
+        restrict_secret_file "$SINGBOX_DIR/relay.json"
         ;;
       SKIP_EXISTING)
         echo "检测到已有可切换的 Shadowsocks / sbrelay-ss2022-in 入站，已保留原配置。"
@@ -347,6 +361,7 @@ SBUNIT
           rm -rf "$bak_dir"
           return 1
         fi
+        restrict_secret_file "$SINGBOX_DIR/config.json"
         ;;
       APPENDED)
         echo "已有配置无 Shadowsocks 入站，已追加 sbrelay-landing-in（端口 ${port}），未改动已有入站/出站/路由。"
@@ -356,6 +371,7 @@ SBUNIT
           rm -rf "$bak_dir"
           return 1
         fi
+        restrict_secret_file "$SINGBOX_DIR/config.json"
         ;;
       SKIP_EXISTING)
         echo "检测到已有 Shadowsocks 入站（优先 sbrelay-landing-in，否则沿用首个 shadowsocks），已保留原配置。"
@@ -433,11 +449,12 @@ uninstall_agent() {
   rm -f /etc/systemd/system/sbrelay-agent.service
   systemctl daemon-reload || true
   rm -f /etc/sudoers.d/sbrelay-helper
-  # 本机若也装了控制端，保留共用的二进制和 pm
-  if [ ! -f /etc/systemd/system/sbrelay-control.service ]; then
-    rm -f /usr/local/lib/sbrelay/sbrelay /usr/local/lib/sbrelay/sbrelay-helper /usr/local/lib/sbrelay/pm.sh \
-      /usr/local/lib/sbrelay/install-agent.sh /usr/local/bin/pm
-    rmdir /usr/local/lib/sbrelay 2>/dev/null || true
+  # 本机若也装了控制端，保留共用的二进制和 pm。
+  # 保留数据卸载时 pm 也留着（不含秘密），这样之后运行 pm → 2 → 1 即可免令牌恢复；只有彻底清除才删 pm。
+  local no_control=0 purged=0
+  [ -f /etc/systemd/system/sbrelay-control.service ] || no_control=1
+  if [ "$no_control" = 1 ]; then
+    rm -f /usr/local/lib/sbrelay/sbrelay /usr/local/lib/sbrelay/sbrelay-helper /usr/local/lib/sbrelay/install-agent.sh
   fi
   if [ "$PURGE" = 1 ]; then
     echo "即将删除本机 agent 注册数据（/var/lib/sbrelay-agent、/etc/sbrelay/agent.env）和切换备份（/var/lib/sbrelay-helper）。"
@@ -449,12 +466,21 @@ uninstall_agent() {
       if getent passwd sbrelay >/dev/null; then
         userdel sbrelay || true
       fi
+      purged=1
       echo "已删除 agent 数据。控制端面板里的这台机器也可在面板中点击删除。"
     else
       echo "已取消删除数据；服务已卸载，数据保留。"
     fi
   else
     echo "说明：注册数据（/var/lib/sbrelay-agent、/etc/sbrelay/agent.env）和切换备份（/var/lib/sbrelay-helper）已保留，重新安装时无需新令牌。"
+  fi
+  if [ "$no_control" = 1 ]; then
+    if [ "$purged" = 1 ]; then
+      rm -f /usr/local/lib/sbrelay/pm.sh /usr/local/bin/pm
+      rmdir /usr/local/lib/sbrelay 2>/dev/null || true
+    elif [ -e /usr/local/bin/pm ]; then
+      echo "恢复：运行 pm，选 2 → 1（原地更新，不需要新令牌）。"
+    fi
   fi
   echo "AGENT_UNINSTALLED"
   echo "sing-box 配置未被这个卸载脚本改动。"

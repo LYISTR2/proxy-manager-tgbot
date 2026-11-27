@@ -1,6 +1,7 @@
 package tgbot
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -86,5 +87,28 @@ func TestPmReuseAfterKeepDataUninstall(t *testing.T) {
 	}
 	if strings.Contains(s, "has_agent && [ -s /var/lib/sbrelay-agent/agent.json ]") {
 		t.Fatal("still requires has_agent before offering token-free update")
+	}
+}
+
+// 保留数据卸载 agent 时不能删掉 pm，否则「pm → 2 → 1 免令牌恢复」无从进入；只有确认彻底清除才删。
+func TestAgentKeepDataUninstallKeepsPm(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(findRepoRoot(t), "deploy", "install-agent.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	i := strings.Index(s, "uninstall_agent() {")
+	j := strings.Index(s, `echo "AGENT_UNINSTALLED"`)
+	if i < 0 || j < i {
+		t.Fatal("uninstall_agent not found")
+	}
+	body := s[i:j]
+	rmPm := strings.Index(body, "/usr/local/bin/pm")
+	guard := strings.Index(body, `if [ "$purged" = 1 ]; then`)
+	if rmPm < 0 || guard < 0 || rmPm < guard {
+		t.Fatalf("pm removal must be guarded by purged=1")
+	}
+	if strings.Count(body, "/usr/local/bin/pm") != 2 { // 一处删除（彻底清除），一处存在性判断
+		t.Fatalf("unexpected pm references in uninstall_agent")
 	}
 }

@@ -118,6 +118,10 @@ func TestSetupSingboxEmptySkeletonRelayWritesInbound(t *testing.T) {
 	if len(outs) != 0 {
 		t.Fatalf("outbounds should stay empty: %v", outs)
 	}
+	// 写入了 SS 密码，原 0644 的骨架应收紧为 0600
+	if fi, err := os.Stat(filepath.Join(dir, "relay.json")); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("relay.json with password should be 0600, got %v %v", fi.Mode().Perm(), err)
+	}
 }
 
 func TestSetupSingboxExistingRelayNotOverwritten(t *testing.T) {
@@ -219,6 +223,9 @@ func TestSetupSingboxLandingAppendsWhenOnlyVLESS(t *testing.T) {
 	rules, _ := route["rules"].([]any)
 	if route["final"] != "direct" || len(rules) != 1 {
 		t.Fatalf("route mutated: %v", route)
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "config.json")); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("config.json with appended password should be 0600, got %v %v", fi.Mode().Perm(), err)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1216,10 +1217,17 @@ func (b *Bot) RunControl(ctx context.Context) error {
 		defer cancel()
 		srv.Shutdown(c)
 	}()
+	var err error
 	if b.cfg.CertFile != "" && b.cfg.KeyFile != "" {
-		return srv.ListenAndServeTLS(b.cfg.CertFile, b.cfg.KeyFile)
+		err = srv.ListenAndServeTLS(b.cfg.CertFile, b.cfg.KeyFile)
+	} else {
+		err = srv.ListenAndServe()
 	}
-	return srv.ListenAndServe()
+	// systemctl stop 触发的正常关闭不算失败，避免日志里每次都是 status=1/FAILURE
+	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
+		return nil
+	}
+	return err
 }
 
 func ListenFromEnv() string {

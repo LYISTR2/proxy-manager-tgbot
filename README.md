@@ -1,77 +1,57 @@
-# proxy-manager-tgbot（sbrelay）
+# proxy-manager-tgbot (`sbrelay`)
 
-用 Telegram Bot 管理「线路机 + 落地机」：线路机自动搭好 SS2022 客户端节点，之后在 Bot 里一键换落地或改成本机直出，**客户端节点（地址 / 端口 / 密码）始终不变**。
+用 Telegram Bot 管理「线路机 + 落地机」：自动搭好 SS2022 节点，随时在 Bot 里一键换落地或切换「本机直出」，**客户端连接信息（地址 / 端口 / 密码）始终不变**。
+
+使用纯 **Rust 单一静态二进制**重写：无需在目标机安装 Go / Python / OpenSSL，无 `sudoers` / helper 拆分，采用 HTTP 长轮询实现毫秒级指令下发。
 
 ## 一键安装
 
-以 root 执行（先 `sudo -i`；不需要 git，脚本会自动下载源码到临时目录，用完即删）：
+以 root 执行（先 `sudo -i`）：
 
 ```bash
+# 打开交互菜单
 bash <(curl -fsSL https://raw.githubusercontent.com/LYISTR2/proxy-manager-tgbot/main/install.sh)
+
+# 直接安装控制端（按提示不回显输入 Bot token，或预先 export SBRELAY_TG_TOKEN）
+bash <(curl -fsSL https://raw.githubusercontent.com/LYISTR2/proxy-manager-tgbot/main/install.sh) control
 ```
 
-不带参数是交互菜单；直接装控制端：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/LYISTR2/proxy-manager-tgbot/main/install.sh) --role control
-```
-
-线路机 / 落地机：在 Bot 里点「添加线路机 / 添加落地机」，把面板给的一行命令以 root 执行即可（令牌走环境变量，不进进程参数）。
-
-已有控制端时，任意机器也可从控制端打开管理菜单（`-k` 只跳过系统 CA，真正校验的是公钥指纹）：
-
-```bash
-curl -LfsS --tlsv1.2 -k --pinnedpubkey sha256//<公钥指纹> https://<控制端>:8443/pm.sh -o /tmp/pm.sh && sudo bash /tmp/pm.sh
-```
-
-## 组成
-
-| 角色 | 作用 |
-|---|---|
-| 控制端 | Telegram Bot + HTTPS 接口（默认 :8443，自签证书 + 指纹校验），保存机器与状态 |
-| 线路机 | agent + sing-box；没装 sing-box 会自动安装，并生成 SS2022 入站，节点链接推送到 Bot |
-| 落地机 | agent + sing-box；自动生成 SS2022 落地入站并上报，已有 Shadowsocks 入站则沿用 |
-
-Bot 功能：添加 / 重命名 / 删除机器，查看节点链接，**换落地**（多条中转时为「给第 N 条中转换落地」），**本机直出**（流量从线路机自己的 IP 出去，不需要落地机），一键回滚。每次切换都会先备份、`sing-box check`，失败不落盘，服务异常自动恢复。
+> 如服务器访问 GitHub 较慢，可加环境变量 `SBRELAY_MIRROR="https://你的镜像前缀/"`。
 
 ## 快速开始
 
-1. 在 [@BotFather](https://t.me/BotFather) 创建 Bot，拿到 token。
-2. 控制端：运行上面的一键命令并选「控制端」（或加 `--role control`），按提示输入 token（不回显）。没有 Go ≥ 1.24 时会临时下载官方 Go（校验 SHA-256）编译，结束即删。
-3. 在 Telegram 给 Bot 发 `/start`，第一个发的人成为管理员。
-4. 点「添加线路机」「添加落地机」，到对应机器以 root 执行面板命令。
-5. 线路机面板 → 「换落地」→ 选落地机或「本机直出」→ 确认。
+1. 在 [@BotFather](https://t.me/BotFather) 创建 Bot，获取 token。
+2. 在控制端机器运行上方安装命令，完成后在 Telegram 给 Bot 发 `/start`（首位发送者成为管理员）。
+3. 在 Bot 面板点「添加线路机 / 添加落地机」，把生成的一行命令复制到目标机器以 root 执行：
+   - 没装 `sing-box` 会自动下载官方稳定版（校验 SHA-256）。
+   - 自动生成 SS2022 入站（`2022-blake3-aes-128-gcm`）并上报；线路机会自动把节点链接推送到 Telegram。
+4. 在线路机面板点「换落地 / 本机直出」→ 选择目标落地机或「本机直出」→ 确认即可。
 
-一键命令后面可加的参数（克隆仓库后 `sudo bash install.sh ...` 也一样）：
+## 常用命令
+
+安装后可随时运行 `sbrelay` 或 `pm`：
 
 ```bash
---role control | relay | landing      # 指定角色；relay/landing 不带 --url 时粘贴面板命令（不回显）
---url https://<控制端>:8443 --pin <证书指纹>   # agent 非交互安装，令牌按提示输入或预先 export SBRELAY_TOKEN
---status | --uninstall | --purge | --dry-run | --help
+pm                      # 打开交互管理菜单（等同 sbrelay menu）
+sbrelay status          # 查看控制端 / Agent / sing-box 状态与证书指纹
+sbrelay set-token       # 更换 Telegram Bot token 并重启控制端
+sbrelay restart         # 重启本机 sbrelay 服务
+sbrelay uninstall       # 卸载服务（保留配置、证书、注册状态，不动 sing-box）
+sbrelay uninstall --purge  # 彻底清除配置与状态数据（需输入 yes 确认）
 ```
 
-需要固定版本时设 `SBRELAY_REF=<分支/标签/提交>`。请用 `bash <(curl ...)`，不要用 `curl ... | bash`（后者无法安全读取不回显输入，脚本会拒绝）。
+## 本地源码编译
 
-## 管理菜单 pm
-
-装过任一角色后直接运行 `pm`：
-
-```
-1 安装/更新控制端   2 安装/更新 agent   3 状态
-4 改 Bot token      5 重启服务          6 卸载
+```bash
+cargo build --release
+# 产物位于 target/release/sbrelay
 ```
 
-也可 `pm status`、`pm 3`。agent 已注册（包括保留数据卸载过）时，选 2 → 1 原地更新，不需要新令牌。
+发版只需推送 `v*` 标签（如 `git tag v0.5.0 && git push origin v0.5.0`），GitHub Actions 会自动编译 `x86_64` 与 `aarch64` 静态 musl 二进制并生成 `SHA256SUMS` 附到 Release。
 
-## 卸载
+## 安全与可靠性
 
-- **保留数据**：`pm` 选 6 → 1，或 `install.sh --uninstall`。控制端保留 state、证书和 token；agent 保留注册数据，之后可免令牌恢复。
-- **彻底清除**：`pm` 选 6 → 2，或 `install.sh --purge`，需输入 `yes` 确认。
-- 卸载不会改动 sing-box 的配置和服务。
-
-## 安全说明
-
-- agent 以非 root 用户运行，只能通过 sudoers 白名单调用固定的 helper（落地机只放行只读 `status`）。
-- agent 与控制端之间：TLS 证书指纹固定 + HMAC 签名 + nonce 防重放；安装令牌一次性、2 小时过期。
-- 令牌和 Bot token 只经环境变量或不回显输入传递，不进命令行参数和日志；含密码的配置文件权限为 600。
-- 切换只改线路机出站与路由，不动入站；sing-box 校验失败时不落盘。
+- **TLS 证书指纹固定（DER SHA-256）**：Agent 在 TLS 握手阶段强校验控制端自签证书指纹，不匹配即拒绝连接。
+- **防重放鉴权**：所有 Agent 请求均带 `HMAC-SHA256` 签名、±120 秒时间窗与 Nonce 防重放；注册接口带单 IP 失败限流，安装令牌一次性且 2 小时过期。
+- **配置零损坏保障**：切换只改出站与 `route.final`，绝不修改入站；每次切换前自动备份并执行 `sing-box check`，失败不落盘，重启异常自动恢复并支持一键回滚。
+- **最小权限与脱敏**：配置文件与密钥权限 `0600`；systemd 启用 `ProtectSystem=strict` 与路径白名单；日志自动脱敏 Bot token 与密码。

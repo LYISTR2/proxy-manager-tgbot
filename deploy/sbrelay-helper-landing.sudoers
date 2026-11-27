@@ -1,2 +1,0 @@
-# 落地机 helper：只放行只读 status，不允许 switch/rollback。
-sbrelay ALL=(root) NOPASSWD: /usr/local/lib/sbrelay/sbrelay-helper status

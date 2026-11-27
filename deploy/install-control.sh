@@ -72,14 +72,20 @@ install_file() {
   install -o root -g root -m "$mode" "$src" "$dst"
 }
 
-# 从标准输入读一行 Bot token，写进 control.env。不回显、不进命令行参数。
-write_token_from_stdin() {
-  python3 -c '
+# 把 token 原子写进 control.env。校验失败返回非 0，调用方必须检查。
+# token 经环境变量传给 python：不走 argv（ps 可见），也不走管道（避免提示语混入）。
+write_token_to_env_file() {
+  local rc=0
+  _SB_TOK="$1" python3 -c '
 import os, sys, tempfile
 path = sys.argv[1]
-tok = sys.stdin.readline().strip()
-if not tok or len(tok) > 256 or any(c.isspace() for c in tok):
-    sys.exit("Bot token 为空或格式不对（不能含空白，长度不超过 256）")
+tok = os.environ.get("_SB_TOK", "").strip()
+if not tok:
+    sys.exit("没有读到 Bot token。")
+if len(tok) > 256:
+    sys.exit("Bot token 过长（超过 256 字符）。")
+if any(c.isspace() for c in tok):
+    sys.exit("Bot token 含空白字符，格式不对。")
 lines = []
 if os.path.exists(path):
     with open(path) as f:
@@ -91,21 +97,33 @@ with os.fdopen(fd, "w") as f:
     f.write("\n".join(lines) + "\n")
 os.chmod(tmp, 0o640)
 os.replace(tmp, path)
-' "$ENV_FILE"
-  chown root:sbrelayctl "$ENV_FILE"
+' "$ENV_FILE" || rc=$?
+  [ "$rc" = 0 ] || return "$rc"
+  chown root:sbrelayctl "$ENV_FILE" 2>/dev/null || true
   chmod 640 "$ENV_FILE"
 }
 
+# 从终端读取 token，结果放进 REPLY_TOK。
+# 提示语写 stderr 或 /dev/tty，绝不写 stdout —— 否则任何管道调用都会把提示当成 token。
+# 优先用 /dev/tty：即使 stdin 被重定向或被管道占用，也能正常交互。
 read_token_interactive() {
-  local tok=""
-  if [ -t 0 ]; then
-    echo "请输入 Telegram Bot token（输入不会显示，回车结束）："
-    IFS= read -rs tok || true
-    echo
+  REPLY_TOK=""
+  local prompt="请输入 Telegram Bot token（输入不会显示，回车结束）："
+  # 用「能否真的打开 /dev/tty」判断，而不是 -r/-w：进程没有控制终端时
+  # /dev/tty 存在但 open 会失败（ENXIO），-r 判断不了这一点。
+  if { : >/dev/tty; } 2>/dev/null; then
+    printf '%s' "$prompt" >&2
+    IFS= read -rs REPLY_TOK </dev/tty || true
+    printf '\n' >&2
+  elif [ -t 0 ]; then
+    printf '%s' "$prompt" >&2
+    IFS= read -rs REPLY_TOK || true
+    printf '\n' >&2
   else
-    IFS= read -r tok || true
+    return 1
   fi
-  printf '%s\n' "$tok"
+  [ -n "$REPLY_TOK" ] || return 1
+  return 0
 }
 
 uninstall_control() {
@@ -149,7 +167,17 @@ if [ "$MODE" = set-token ]; then
     echo "还没有安装控制端（找不到 $ENV_FILE）。" >&2
     exit 1
   fi
-  read_token_interactive | write_token_from_stdin
+  if [ -n "${SBRELAY_TG_TOKEN:-}" ]; then
+    NEW_TOK=$SBRELAY_TG_TOKEN
+  elif read_token_interactive; then
+    NEW_TOK=$REPLY_TOK
+  else
+    echo "没有读到 Bot token：当前不是可交互终端，也没有提供 SBRELAY_TG_TOKEN。" >&2
+    echo "用法：SBRELAY_TG_TOKEN=xxx $0 --set-token" >&2
+    exit 1
+  fi
+  write_token_to_env_file "$NEW_TOK"
+  NEW_TOK=""; REPLY_TOK=""
   systemctl restart sbrelay-control.service
   sleep 1
   if systemctl is-active --quiet sbrelay-control.service; then
@@ -297,10 +325,16 @@ rm -f "$TMPENV"
 TMPENV=""
 if [ "$OLD_TOKEN_LINE" != 1 ]; then
   if [ -n "${SBRELAY_TG_TOKEN:-}" ]; then
-    printf '%s\n' "$SBRELAY_TG_TOKEN" | write_token_from_stdin
+    NEW_TOK=$SBRELAY_TG_TOKEN
+  elif read_token_interactive; then
+    NEW_TOK=$REPLY_TOK
   else
-    read_token_interactive | write_token_from_stdin
+    echo "没有读到 Bot token：当前不是可交互终端，也没有提供 SBRELAY_TG_TOKEN。" >&2
+    echo "用法：SBRELAY_TG_TOKEN=xxx bash $0   （或在终端里直接运行，会提示输入）" >&2
+    exit 1
   fi
+  write_token_to_env_file "$NEW_TOK"
+  NEW_TOK=""; REPLY_TOK=""
 fi
 unset SBRELAY_TG_TOKEN
 

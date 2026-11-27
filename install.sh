@@ -259,9 +259,14 @@ install_agent() {
   [ -n "$PIN" ] || die "缺少 --pin（证书指纹，面板命令里 --pin 后面那串）。" 2
   if [ -z "$tok" ] && [ "$DRY_RUN" != 1 ]; then
     [ -t 0 ] || die "缺少安装令牌：请用环境变量 SBRELAY_TOKEN 提供。" 2
-    printf '请输入面板给的安装令牌（不回显）：'
-    IFS= read -rs tok || true
-    echo
+    # 提示写 stderr，避免任何情况下混进 stdin 或被命令替换吃掉
+    printf '请输入面板给的安装令牌（不回显）：' >&2
+    if { : >/dev/tty; } 2>/dev/null; then
+      IFS= read -rs tok </dev/tty || true
+    else
+      IFS= read -rs tok || true
+    fi
+    printf '\n' >&2
     [ -n "$tok" ] || die "没有输入令牌，已取消。" 2
   fi
   local -a args=(--url "${URL%/}" --pin "$PIN" --role "$ROLE")

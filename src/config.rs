@@ -1,5 +1,7 @@
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -8,6 +10,32 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::protocol::Role;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    #[default]
+    Pin,
+    Webpki,
+}
+
+impl TlsMode {
+    pub fn cn(self) -> &'static str {
+        match self {
+            TlsMode::Pin => "自签指纹固定",
+            TlsMode::Webpki => "公信 CA（反代/域名）",
+        }
+    }
+}
+
+impl fmt::Display for TlsMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TlsMode::Pin => write!(f, "pin"),
+            TlsMode::Webpki => write!(f, "webpki"),
+        }
+    }
+}
 
 pub const ETC_DIR: &str = "/etc/sbrelay";
 pub const VAR_DIR: &str = "/var/lib/sbrelay";
@@ -31,6 +59,12 @@ pub struct ControlConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
     pub public_url: String,
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+    #[serde(default = "default_true")]
+    pub listen_tls: bool,
+    #[serde(default)]
+    pub trust_proxy: bool,
     #[serde(default = "default_var_dir")]
     pub data_dir: PathBuf,
     #[serde(default = "default_cert_file")]
@@ -46,7 +80,8 @@ pub struct ControlConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub url: String,
-    pub tls_pin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_pin: Option<String>,
     pub role: Role,
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -64,6 +99,9 @@ pub struct AgentConfig {
     pub service: String,
 }
 
+fn default_true() -> bool {
+    true
+}
 fn default_listen() -> String {
     "0.0.0.0:8443".to_string()
 }
@@ -93,12 +131,32 @@ impl ControlConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("读取控制端配置失败: {}", path.display()))?;
-        let mut cfg: Self = toml::from_str(&raw).context("解析 control.toml 失败")?;
-        cfg.public_url = validate_public_url(&cfg.public_url)?;
-        if cfg.tg_token.trim().is_empty() {
+        Self::from_toml_str(&raw)
+    }
+
+    pub fn from_toml_str(raw: &str) -> Result<Self> {
+        let mut cfg: Self = toml::from_str(raw).context("解析 control.toml 失败")?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&mut self) -> Result<()> {
+        self.public_url = validate_public_url(&self.public_url)?;
+        if self.tg_token.trim().is_empty() {
             bail!("control.toml 缺少 tg_token");
         }
-        Ok(cfg)
+        let addr: SocketAddr = self
+            .listen
+            .parse()
+            .with_context(|| format!("监听地址不合法: {}", self.listen))?;
+        if !self.listen_tls && !addr.ip().is_loopback() {
+            bail!("listen_tls = false 仅允许监听回环地址（如 127.0.0.1:8443）");
+        }
+        let host = public_url_host(&self.public_url)?;
+        if self.tls_mode == TlsMode::Webpki && is_ip_host(&host) {
+            bail!("tls_mode = webpki 要求 public_url 使用域名，不能使用裸 IP");
+        }
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -111,10 +169,25 @@ impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("读取 agent 配置失败: {}", path.display()))?;
-        let mut cfg: Self = toml::from_str(&raw).context("解析 agent.toml 失败")?;
-        cfg.url = validate_public_url(&cfg.url)?;
-        cfg.tls_pin = validate_pin(&cfg.tls_pin)?;
+        Self::from_toml_str(&raw)
+    }
+
+    pub fn from_toml_str(raw: &str) -> Result<Self> {
+        let mut cfg: Self = toml::from_str(raw).context("解析 agent.toml 失败")?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    pub fn validate(&mut self) -> Result<()> {
+        self.url = validate_public_url(&self.url)?;
+        self.tls_pin = match self.tls_pin.take() {
+            Some(p) if !p.trim().is_empty() => Some(validate_pin(&p)?),
+            _ => None,
+        };
+        if self.tls_pin.is_none() && is_ip_host(&public_url_host(&self.url)?) {
+            bail!("控制端地址为 IP 时必须提供证书指纹（--pin）");
+        }
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -183,6 +256,48 @@ pub fn validate_public_url(raw: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+pub fn public_url_host(url: &str) -> Result<String> {
+    let parsed = Url::parse(url.trim()).with_context(|| format!("控制端地址不合法: {url}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("控制端地址缺少主机名"))?;
+    Ok(host.trim_matches(['[', ']']).to_string())
+}
+
+pub fn is_ip_host(host: &str) -> bool {
+    host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok()
+}
+
+/// 解析用户输入的域名 / URL / IP，返回标准化 `https://...` URL 以及是否显式携带了端口。
+pub fn parse_public_url_input(raw: &str, default_ip_port: &str) -> Result<(String, bool)> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("控制端地址不能为空");
+    }
+    if trimmed.to_ascii_lowercase().starts_with("http://") {
+        bail!("控制端地址必须使用 https://: {raw}");
+    }
+    let (candidate, explicit_port) = if trimmed.contains("://") {
+        let validated = validate_public_url(trimmed)?;
+        let parsed = Url::parse(&validated)?;
+        return Ok((validated, parsed.port().is_some()));
+    } else if let Ok(ip) = trimmed.trim_matches(['[', ']']).parse::<IpAddr>() {
+        let formatted = if ip.is_ipv6() {
+            format!("https://[{ip}]:{default_ip_port}")
+        } else {
+            format!("https://{ip}:{default_ip_port}")
+        };
+        (formatted, false)
+    } else {
+        let with_scheme = format!("https://{trimmed}");
+        let validated = validate_public_url(&with_scheme)?;
+        let parsed = Url::parse(&validated)?;
+        return Ok((validated, parsed.port().is_some()));
+    };
+    let validated = validate_public_url(&candidate)?;
+    Ok((validated, explicit_port))
+}
+
 pub fn validate_pin(raw: &str) -> Result<String> {
     let pin = raw.trim().to_ascii_lowercase();
     if pin.len() != 64 || !pin.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -208,6 +323,86 @@ mod tests {
         assert!(validate_public_url("http://1.2.3.4:8443").is_err());
         assert!(validate_public_url("https://1.2.3.4:8443/path").is_err());
         assert!(validate_public_url("https://user:pass@1.2.3.4:8443").is_err());
+    }
+
+    #[test]
+    fn public_url_input_parsing() {
+        assert_eq!(
+            parse_public_url_input("ctl.example.com", "8443").unwrap(),
+            ("https://ctl.example.com".into(), false)
+        );
+        assert_eq!(
+            parse_public_url_input("https://ctl.example.com:8443/", "8443").unwrap(),
+            ("https://ctl.example.com:8443".into(), true)
+        );
+        assert_eq!(
+            parse_public_url_input("ctl.example.com:9443", "8443").unwrap(),
+            ("https://ctl.example.com:9443".into(), true)
+        );
+        assert_eq!(
+            parse_public_url_input("1.2.3.4", "8443").unwrap(),
+            ("https://1.2.3.4:8443".into(), false)
+        );
+        assert_eq!(
+            parse_public_url_input("2001:db8::1", "8443").unwrap(),
+            ("https://[2001:db8::1]:8443".into(), false)
+        );
+        assert!(parse_public_url_input("http://ctl.example.com", "8443").is_err());
+    }
+
+    #[test]
+    fn config_validation_and_legacy_compat() {
+        let legacy_ctl = r#"
+tg_token = "123:abc"
+listen = "0.0.0.0:8443"
+public_url = "https://1.2.3.4:8443"
+"#;
+        let ctl = ControlConfig::from_toml_str(legacy_ctl).unwrap();
+        assert_eq!(ctl.tls_mode, TlsMode::Pin);
+        assert!(ctl.listen_tls);
+        assert!(!ctl.trust_proxy);
+
+        let bad_plain = r#"
+tg_token = "123:abc"
+listen = "0.0.0.0:8443"
+public_url = "https://ctl.example.com"
+tls_mode = "webpki"
+listen_tls = false
+"#;
+        assert!(ControlConfig::from_toml_str(bad_plain).is_err());
+
+        let bad_webpki_ip = r#"
+tg_token = "123:abc"
+listen = "127.0.0.1:8443"
+public_url = "https://1.2.3.4:8443"
+tls_mode = "webpki"
+listen_tls = false
+"#;
+        assert!(ControlConfig::from_toml_str(bad_webpki_ip).is_err());
+
+        let ok_webpki = r#"
+tg_token = "123:abc"
+listen = "127.0.0.1:8443"
+public_url = "https://ctl.example.com"
+tls_mode = "webpki"
+listen_tls = false
+trust_proxy = true
+"#;
+        assert!(ControlConfig::from_toml_str(ok_webpki).is_ok());
+
+        let legacy_agent = format!(
+            "url = \"https://1.2.3.4:8443\"\ntls_pin = \"{}\"\nrole = \"relay\"\n",
+            "a".repeat(64)
+        );
+        let ag = AgentConfig::from_toml_str(&legacy_agent).unwrap();
+        assert_eq!(ag.tls_pin.as_deref(), Some("a".repeat(64).as_str()));
+
+        let domain_agent = "url = \"https://ctl.example.com\"\nrole = \"landing\"\n";
+        let ag2 = AgentConfig::from_toml_str(domain_agent).unwrap();
+        assert!(ag2.tls_pin.is_none());
+
+        let bad_ip_agent = "url = \"https://1.2.3.4:8443\"\nrole = \"relay\"\n";
+        assert!(AgentConfig::from_toml_str(bad_ip_agent).is_err());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod agent;
+mod backup;
 mod bot;
 mod config;
 mod control;
@@ -11,10 +12,17 @@ mod tls;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{AGENT_CONFIG, CONTROL_CONFIG};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TlsModeArg {
+    Auto,
+    Pin,
+    Webpki,
+}
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +65,32 @@ enum Cmd {
         #[arg(long)]
         purge: bool,
     },
+    /// 打包加密备份控制端配置、证书与状态
+    Backup {
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        auto_pass: bool,
+    },
+    /// 从加密备份恢复控制端并启动服务
+    Restore {
+        file: PathBuf,
+        #[arg(long)]
+        public_url: Option<String>,
+        #[arg(long)]
+        listen: Option<String>,
+        #[arg(long, value_enum)]
+        tls_mode: Option<TlsModeArg>,
+    },
+    /// 灾备：将本机 Agent 重新指向新的控制端地址（保留节点与身份）
+    Rebind {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        pin: Option<String>,
+        #[arg(long)]
+        webpki: bool,
+    },
     /// 显示版本号
     Version,
 }
@@ -69,6 +103,10 @@ enum SetupRole {
         listen: Option<String>,
         #[arg(long)]
         public_url: Option<String>,
+        #[arg(long, value_enum, default_value_t = TlsModeArg::Auto)]
+        tls_mode: TlsModeArg,
+        #[arg(long)]
+        plain_http: bool,
         #[arg(long)]
         regen_cert: bool,
     },
@@ -78,6 +116,8 @@ enum SetupRole {
         url: Option<String>,
         #[arg(long)]
         pin: Option<String>,
+        #[arg(long)]
+        clear_pin: bool,
         #[arg(long)]
         force_register: bool,
     },
@@ -116,13 +156,16 @@ async fn main() -> Result<()> {
             SetupRole::Control {
                 listen,
                 public_url,
+                tls_mode,
+                plain_http,
                 regen_cert,
-            } => ops::setup_control(listen, public_url, regen_cert).await,
+            } => ops::setup_control(listen, public_url, tls_mode, plain_http, regen_cert).await,
             SetupRole::Agent {
                 url,
                 pin,
+                clear_pin,
                 force_register,
-            } => ops::setup_agent(url, pin, force_register).await,
+            } => ops::setup_agent(url, pin, clear_pin, force_register).await,
         },
         Cmd::Menu => ops::interactive_menu().await,
         Cmd::Status => {
@@ -132,6 +175,14 @@ async fn main() -> Result<()> {
         Cmd::SetToken => ops::set_token(),
         Cmd::Restart => ops::restart_services(),
         Cmd::Uninstall { purge } => ops::uninstall(purge),
+        Cmd::Backup { output, auto_pass } => ops::backup_control(output, auto_pass),
+        Cmd::Restore {
+            file,
+            public_url,
+            listen,
+            tls_mode,
+        } => ops::restore_control(&file, public_url, listen, tls_mode).await,
+        Cmd::Rebind { url, pin, webpki } => ops::rebind_agent(&url, pin, webpki),
         Cmd::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())

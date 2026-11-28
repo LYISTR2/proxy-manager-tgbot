@@ -166,6 +166,26 @@ impl Store {
         Ok(())
     }
 
+    pub fn snapshot_json(&self) -> Result<Vec<u8>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(serde_json::to_vec_pretty(&inner.state)?)
+    }
+
+    pub fn active_machine_counts(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        let mut relays = 0usize;
+        let mut landings = 0usize;
+        for m in inner.state.machines.values() {
+            if !m.revoked {
+                match m.role {
+                    Role::Relay => relays += 1,
+                    Role::Landing => landings += 1,
+                }
+            }
+        }
+        (relays, landings)
+    }
+
     pub fn owner(&self) -> i64 {
         self.inner.lock().unwrap().state.owner_id
     }

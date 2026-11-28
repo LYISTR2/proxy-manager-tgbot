@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,16 +25,27 @@ pub struct ControlState {
     pub store: Arc<Store>,
     pub poll_wait: Duration,
     pub on_node_ready: Option<NodeReadyHook>,
+    pub trust_proxy: bool,
     nonce_seen: Mutex<HashMap<String, i64>>,
     reg_fails: Mutex<HashMap<String, Vec<Instant>>>,
 }
 
 impl ControlState {
+    #[cfg(test)]
     pub fn new(store: Arc<Store>, on_node_ready: Option<NodeReadyHook>) -> Arc<Self> {
+        Self::new_with_proxy(store, on_node_ready, false)
+    }
+
+    pub fn new_with_proxy(
+        store: Arc<Store>,
+        on_node_ready: Option<NodeReadyHook>,
+        trust_proxy: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             poll_wait: Duration::from_secs(25),
             on_node_ready,
+            trust_proxy,
             nonce_seen: Mutex::new(HashMap::new()),
             reg_fails: Mutex::new(HashMap::new()),
         })
@@ -114,6 +125,29 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .unwrap_or("")
 }
 
+fn extract_client_ip(addr: &SocketAddr, headers: &HeaderMap, trust_proxy: bool) -> String {
+    if !trust_proxy {
+        return addr.ip().to_string();
+    }
+    if let Ok(cf_ip) = header_str(headers, "cf-connecting-ip").trim().parse::<IpAddr>() {
+        return cf_ip.to_string();
+    }
+    if addr.ip().is_loopback() {
+        if let Ok(real_ip) = header_str(headers, "x-real-ip").trim().parse::<IpAddr>() {
+            return real_ip.to_string();
+        }
+        let xff = header_str(headers, "x-forwarded-for");
+        let ips: Vec<IpAddr> = xff
+            .split(',')
+            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+            .collect();
+        if let Some(ip) = ips.iter().rev().find(|ip| !ip.is_loopback()).or_else(|| ips.last()) {
+            return ip.to_string();
+        }
+    }
+    addr.ip().to_string()
+}
+
 pub fn router(state: Arc<ControlState>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -126,9 +160,10 @@ pub fn router(state: Arc<ControlState>) -> Router {
 async fn handle_register(
     State(state): State<Arc<ControlState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<RegisterResponse>, (StatusCode, String)> {
-    let ip = addr.ip().to_string();
+    let ip = extract_client_ip(&addr, &headers, state.trust_proxy);
     let now = Instant::now();
     if !state.allow_register(&ip, now) {
         return Err((
@@ -237,6 +272,7 @@ mod tests {
             store: store.clone(),
             poll_wait: Duration::from_millis(50),
             on_node_ready: None,
+            trust_proxy: false,
             nonce_seen: Mutex::new(HashMap::new()),
             reg_fails: Mutex::new(HashMap::new()),
         });
@@ -381,5 +417,24 @@ mod tests {
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
 
         handle.shutdown();
+    }
+
+    #[test]
+    fn extract_client_ip_respects_proxy_trust() {
+        let loopback: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let remote: SocketAddr = "198.51.100.10:12345".parse().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "9.9.9.9, 203.0.113.7".parse().unwrap());
+        assert_eq!(extract_client_ip(&loopback, &headers, false), "127.0.0.1");
+        assert_eq!(extract_client_ip(&loopback, &headers, true), "203.0.113.7");
+        assert_eq!(extract_client_ip(&remote, &headers, true), "198.51.100.10");
+
+        headers.insert("x-real-ip", "203.0.113.8".parse().unwrap());
+        assert_eq!(extract_client_ip(&loopback, &headers, true), "203.0.113.8");
+
+        headers.insert("cf-connecting-ip", "203.0.113.9".parse().unwrap());
+        assert_eq!(extract_client_ip(&remote, &headers, true), "203.0.113.9");
+        assert_eq!(extract_client_ip(&remote, &headers, false), "198.51.100.10");
     }
 }

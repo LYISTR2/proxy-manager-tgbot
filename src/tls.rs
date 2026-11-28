@@ -181,7 +181,7 @@ pub fn build_pinned_client(pin_hex: &str, timeout: Duration) -> Result<reqwest::
         .context("构造 TLS Pinning HTTP 客户端失败")
 }
 
-/// 构造普通 HTTPS 客户端（走 webpki 根证书，用于访问 Telegram API / GitHub）。
+/// 构造普通 HTTPS 客户端（走 webpki 根证书，用于访问 Telegram API / GitHub 或反代控制端）。
 pub fn build_public_client(timeout: Duration) -> Result<reqwest::Client> {
     ensure_crypto_provider();
     reqwest::Client::builder()
@@ -189,6 +189,14 @@ pub fn build_public_client(timeout: Duration) -> Result<reqwest::Client> {
         .user_agent(concat!("sbrelay/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("构造 HTTPS 客户端失败")
+}
+
+/// 按是否提供证书指纹构造 Agent 客户端：有指纹走 Pinning，无指纹走标准 webpki 公信 CA 校验。
+pub fn build_agent_client(pin_hex: Option<&str>, timeout: Duration) -> Result<reqwest::Client> {
+    match pin_hex.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(pin) => build_pinned_client(pin, timeout),
+        None => build_public_client(timeout),
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +242,21 @@ mod tests {
             .send()
             .await;
         assert!(err.is_err(), "错误指纹必须被拒绝");
+
+        let ok_agent = build_agent_client(Some(&pin), Duration::from_secs(5)).unwrap();
+        let resp2 = ok_agent
+            .get(format!("https://{addr}/healthz"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.text().await.unwrap(), "ok");
+
+        let webpki_agent = build_agent_client(None, Duration::from_secs(5)).unwrap();
+        let err_self_signed = webpki_agent
+            .get(format!("https://{addr}/healthz"))
+            .send()
+            .await;
+        assert!(err_self_signed.is_err(), "webpki 模式必须拒绝自签证书");
 
         handle.shutdown();
     }

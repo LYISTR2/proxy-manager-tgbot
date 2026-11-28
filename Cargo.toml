@@ -1,6 +1,6 @@
 [package]
 name = "sbrelay"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Lightweight Telegram Bot + single-binary agent to manage sing-box SS2022 relays and landings"
@@ -11,16 +11,18 @@ anyhow = "1"
 axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
 rcgen = "0.13"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "multipart"] }
 rpassword = "7"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"

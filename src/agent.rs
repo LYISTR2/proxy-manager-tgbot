@@ -14,15 +14,15 @@ use crate::protocol::{
     RegisterRequest, RegisterResponse, ResultRequest,
 };
 use crate::singbox::{EgressTarget, ServiceRunner, SingboxManager, SystemdRunner};
-use crate::tls::build_pinned_client;
+use crate::tls::build_agent_client;
 
-/// 使用一次性令牌向控制端注册（强校验 TLS 指纹）。
+/// 使用一次性令牌向控制端注册（有指纹则强校验指纹，否则走公信 CA 校验）。
 pub async fn register_with_token(
     url: &str,
-    tls_pin: &str,
+    tls_pin: Option<&str>,
     token: &str,
 ) -> Result<RegisterResponse> {
-    let cli = build_pinned_client(tls_pin, Duration::from_secs(20))?;
+    let cli = build_agent_client(tls_pin, Duration::from_secs(20))?;
     let endpoint = format!("{}/v1/register", url.trim_end_matches('/'));
     let resp = cli
         .post(&endpoint)
@@ -31,7 +31,18 @@ pub async fn register_with_token(
         })
         .send()
         .await
-        .map_err(|e| anyhow!("连接控制端失败: {}", redact(&e.to_string())))?;
+        .map_err(|e| {
+            let msg = redact(&e.to_string());
+            if tls_pin.is_none()
+                && (msg.contains("certificate")
+                    || msg.contains("UnknownIssuer")
+                    || msg.contains("tls"))
+            {
+                anyhow!("连接控制端失败: {msg}（若控制端使用自签证书直连，请传入 --pin <指纹>）")
+            } else {
+                anyhow!("连接控制端失败: {msg}")
+            }
+        })?;
 
     let status = resp.status();
     if status.as_u16() == 401 || status.as_u16() == 403 {
@@ -71,7 +82,7 @@ impl AgentRunner<SystemdRunner> {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("agent.toml 缺少 secret，请先运行 sbrelay setup agent"))?;
         // 长轮询服务端挂起 25 秒，客户端超时设 45 秒留足余量
-        let client = build_pinned_client(&cfg.tls_pin, Duration::from_secs(45))?;
+        let client = build_agent_client(cfg.tls_pin.as_deref(), Duration::from_secs(45))?;
         let singbox = Arc::new(SingboxManager::system(
             cfg.singbox_config.clone(),
             cfg.singbox_bin.clone(),
@@ -222,7 +233,7 @@ mod tests {
     use crate::control::{router, ControlState};
     use crate::protocol::{Egress, OutboundSpec, Role, SS2022_METHOD};
     use crate::store::Store;
-    use crate::tls::{build_server_tls, generate_self_signed};
+    use crate::tls::{build_pinned_client, build_server_tls, generate_self_signed};
 
     struct OkRunner;
     impl ServiceRunner for OkRunner {
@@ -263,7 +274,9 @@ mod tests {
         let tok = store
             .new_install_token("香港测试", Role::Relay, Duration::from_secs(300))
             .unwrap();
-        let reg = register_with_token(&url, &pin, &tok.token).await.unwrap();
+        let reg = register_with_token(&url, Some(&pin), &tok.token)
+            .await
+            .unwrap();
 
         let sb = Arc::new(SingboxManager {
             config_path: dir.path().join("config.json"),

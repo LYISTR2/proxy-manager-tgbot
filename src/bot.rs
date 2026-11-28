@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,7 +9,8 @@ use serde_json::{json, Value};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::config::ControlConfig;
+use crate::backup::{create_backup, gen_backup_passphrase};
+use crate::config::{ControlConfig, TlsMode};
 use crate::protocol::{
     format_ss_link, redact, CommandOp, CommandResult, Egress, OutboundSpec, Role,
 };
@@ -38,6 +40,7 @@ enum CallbackAction {
     Rename(String),
     DeleteAsk(String),
     DeleteExec(String),
+    Backup,
 }
 
 impl CallbackAction {
@@ -47,6 +50,9 @@ impl CallbackAction {
         }
         if data == "home" {
             return Some(Self::Home);
+        }
+        if data == "bk" {
+            return Some(Self::Backup);
         }
         let parts: Vec<&str> = data.split(':').collect();
         match parts.as_slice() {
@@ -145,8 +151,9 @@ struct TgCallback {
 
 pub struct Bot {
     cfg: ControlConfig,
+    config_path: PathBuf,
     store: Arc<Store>,
-    pin: String,
+    pin: Option<String>,
     http: reqwest::Client,
     expect: Mutex<HashMap<i64, Expect>>,
     in_flight: Mutex<HashSet<String>>,
@@ -154,7 +161,12 @@ pub struct Bot {
 }
 
 impl Bot {
-    pub fn new(cfg: ControlConfig, store: Arc<Store>, pin: String) -> Result<Arc<Self>> {
+    pub fn new(
+        cfg: ControlConfig,
+        config_path: PathBuf,
+        store: Arc<Store>,
+        pin: Option<String>,
+    ) -> Result<Arc<Self>> {
         if let Some(hint) = cfg.owner_hint {
             if hint != 0 && store.owner() == 0 {
                 let _ = store.set_owner(hint);
@@ -163,6 +175,7 @@ impl Bot {
         let http = build_public_client(Duration::from_secs(45))?;
         Ok(Arc::new(Self {
             cfg,
+            config_path,
             store,
             pin,
             http,
@@ -231,6 +244,108 @@ impl Bot {
                 json!({ "callback_query_id": cb_id, "text": text }),
             )
             .await;
+    }
+
+    async fn send_document(
+        &self,
+        chat: i64,
+        filename: &str,
+        bytes: Vec<u8>,
+        caption: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/sendDocument",
+            self.cfg.tg_token
+        );
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")?;
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", chat.to_string())
+            .text("caption", caption.to_string())
+            .text("parse_mode", "HTML")
+            .part("document", part);
+        let resp = self
+            .http
+            .post(url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", redact(&e.to_string())))?;
+        let tr: TgResp = resp.json().await?;
+        if !tr.ok {
+            bail!("telegram: {}", tr.description);
+        }
+        Ok(())
+    }
+
+    async fn send_backup(&self, chat: i64) {
+        let pass = gen_backup_passphrase();
+        let state_json = match self.store.snapshot_json() {
+            Ok(b) => b,
+            Err(e) => {
+                self.send(
+                    chat,
+                    &format!("导出状态失败：{}", escape(&e.to_string())),
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+        let cfg_path = self.config_path.clone();
+        let pass_clone = pass.clone();
+        let bytes = match tokio::task::spawn_blocking(move || {
+            create_backup(&cfg_path, Some(&state_json), &pass_clone)
+        })
+        .await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                self.send(
+                    chat,
+                    &format!("生成加密备份失败：{}", escape(&e.to_string())),
+                    None,
+                )
+                .await;
+                return;
+            }
+            Err(e) => {
+                self.send(
+                    chat,
+                    &format!("生成备份任务异常：{}", escape(&e.to_string())),
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let (relays, landings) = self.store.active_machine_counts();
+        let filename = format!(
+            "sbrelay-backup-{}.sbr",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        );
+        let caption = format!(
+            "控制端加密备份（线路机 {relays} 台 / 落地机 {landings} 台）\n\
+             对外地址：<code>{}</code>（{}）\n\
+             解密口令：<tg-spoiler><code>{}</code></tg-spoiler>\n\n\
+             迁移到新服务器后执行：\n\
+             <pre>sbrelay restore {}</pre>\n\
+             再将域名解析或反代切到新机，现有 Agent 无需重新对接，会自动重连上报。",
+            escape(&self.cfg.public_url),
+            self.cfg.tls_mode.cn(),
+            escape(&pass),
+            escape(&filename),
+        );
+        if let Err(e) = self.send_document(chat, &filename, bytes, &caption).await {
+            self.send(
+                chat,
+                &format!("发送备份文件失败：{}", escape(&e.to_string())),
+                None,
+            )
+            .await;
+        }
     }
 
     fn allowed(&self, uid: i64) -> bool {
@@ -311,10 +426,16 @@ impl Bot {
     }
 
     pub fn install_command(&self, token: &str) -> String {
-        format!(
-            "export HISTCONTROL=ignorespace\n SBRELAY_TOKEN={} bash <(curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh) agent --url '{}' --pin '{}'",
-            token, self.cfg.repo, self.cfg.public_url, self.pin
-        )
+        match (self.cfg.tls_mode, self.pin.as_deref()) {
+            (TlsMode::Webpki, _) | (_, None) => format!(
+                "export HISTCONTROL=ignorespace\n SBRELAY_TOKEN={} bash <(curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh) agent --url '{}'",
+                token, self.cfg.repo, self.cfg.public_url
+            ),
+            (TlsMode::Pin, Some(pin)) => format!(
+                "export HISTCONTROL=ignorespace\n SBRELAY_TOKEN={} bash <(curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh) agent --url '{}' --pin '{}'",
+                token, self.cfg.repo, self.cfg.public_url, pin
+            ),
+        }
     }
 
     fn egress_label(&self, egress: Option<&Egress>) -> String {
@@ -355,10 +476,13 @@ impl Bot {
 
         if relays.is_empty() && landings.is_empty() {
             let text = "线路切换面板\n\n还没有机器。\n1. 点「添加线路机」自动搭建 SS2022 客户端节点；\n2. 点「添加落地机」自动搭建 SS2022 落地；\n3. 之后可在不动客户端节点的前提下随时换落地或改本机直出。".to_string();
-            let kb = Keyboard::new(vec![vec![
-                Btn::new("添加线路机", "add:r"),
-                Btn::new("添加落地机", "add:l"),
-            ]]);
+            let kb = Keyboard::new(vec![
+                vec![
+                    Btn::new("添加线路机", "add:r"),
+                    Btn::new("添加落地机", "add:l"),
+                ],
+                vec![Btn::new("备份控制端", "bk")],
+            ]);
             return (text, kb);
         }
 
@@ -408,6 +532,7 @@ impl Bot {
             Btn::new("添加线路机", "add:r"),
             Btn::new("添加落地机", "add:l"),
         ]);
+        rows.push(vec![Btn::new("备份控制端", "bk")]);
         (text.trim_end().to_string(), Keyboard::new(rows))
     }
 
@@ -713,11 +838,16 @@ impl Bot {
                 self.send(
                     chat.id,
                     &format!(
-                        "命令：\n/start 首页\n/status 刷新列表\n/add 名字 添加线路机（{NAME_HINT}）\n/add-landing 名字 添加落地机\n/cancel 取消输入\n/help 本说明\n\n日常操作直接点按钮即可。"
+                        "命令：\n/start 首页\n/status 刷新列表\n/add 名字 添加线路机（{NAME_HINT}）\n/add-landing 名字 添加落地机\n/backup 导出控制端加密备份\n/cancel 取消输入\n/help 本说明\n\n日常操作直接点按钮即可。"
                     ),
                     None,
                 )
                 .await;
+            }
+            "/backup" => {
+                self.expect.lock().unwrap().remove(&uid);
+                self.send(chat.id, "正在生成加密备份…", None).await;
+                self.send_backup(chat.id).await;
             }
             "/status" | "/home" => {
                 self.expect.lock().unwrap().remove(&uid);
@@ -964,6 +1094,10 @@ impl Bot {
                 let (t, kb) = self.home_view();
                 self.edit(chat_id, mid, &t, Some(&kb)).await;
             }
+            CallbackAction::Backup => {
+                self.answer(&cb.id, "正在生成加密备份…").await;
+                self.send_backup(chat_id).await;
+            }
         }
     }
 
@@ -1114,6 +1248,7 @@ mod tests {
             CallbackAction::parse("go:abc:def"),
             Some(CallbackAction::ExecLanding("abc".into(), "def".into()))
         );
+        assert_eq!(CallbackAction::parse("bk"), Some(CallbackAction::Backup));
         assert!(CallbackAction::parse("unknown:1").is_none());
     }
 
@@ -1125,14 +1260,44 @@ mod tests {
             tg_token: "123456:testtoken".into(),
             listen: "0.0.0.0:8443".into(),
             public_url: "https://1.2.3.4:8443".into(),
+            tls_mode: TlsMode::Pin,
+            listen_tls: true,
+            trust_proxy: false,
             data_dir: PathBuf::from(dir.path()),
             cert_file: dir.path().join("tls.crt"),
             key_file: dir.path().join("tls.key"),
             owner_hint: Some(42),
             repo: "LYISTR2/proxy-manager-tgbot".into(),
         };
-        let bot = Bot::new(cfg, store.clone(), "a".repeat(64)).unwrap();
+        let pin = "a".repeat(64);
+        let bot = Bot::new(
+            cfg.clone(),
+            dir.path().join("control.toml"),
+            store.clone(),
+            Some(pin.clone()),
+        )
+        .unwrap();
         assert_eq!(store.owner(), 42);
+        assert!(bot.install_command("tok1").contains("--pin"));
+
+        let webpki_cfg = ControlConfig {
+            public_url: "https://ctl.example.com".into(),
+            listen: "127.0.0.1:8443".into(),
+            tls_mode: TlsMode::Webpki,
+            listen_tls: false,
+            trust_proxy: true,
+            ..cfg
+        };
+        let webpki_bot = Bot::new(
+            webpki_cfg,
+            dir.path().join("control.toml"),
+            store.clone(),
+            None,
+        )
+        .unwrap();
+        let cmd_webpki = webpki_bot.install_command("tok2");
+        assert!(cmd_webpki.contains("--url 'https://ctl.example.com'"));
+        assert!(!cmd_webpki.contains("--pin"));
 
         let rt = store
             .new_install_token("香港线路", Role::Relay, Duration::from_secs(60))

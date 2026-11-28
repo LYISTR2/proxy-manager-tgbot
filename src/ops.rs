@@ -1,12 +1,13 @@
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::Utc;
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,16 +16,19 @@ use tokio::sync::watch;
 use tracing::info;
 
 use crate::agent::register_with_token;
+use crate::backup::{create_backup, decrypt_backup, gen_backup_passphrase};
 use crate::bot::Bot;
 use crate::config::{
-    validate_pin, validate_public_url, write_atomic, AgentConfig, ControlConfig, AGENT_CONFIG,
-    AGENT_SERVICE, CONTROL_CONFIG, CONTROL_SERVICE, DEFAULT_REPO, ETC_DIR, PM_LINK, SBRELAY_BIN,
-    SINGBOX_BIN, SINGBOX_CONFIG, SINGBOX_SERVICE, SINGBOX_SERVICE_NAME, TLS_CERT, TLS_KEY, VAR_DIR,
+    is_ip_host, parse_public_url_input, public_url_host, validate_pin, write_atomic, AgentConfig,
+    ControlConfig, TlsMode, AGENT_CONFIG, AGENT_SERVICE, CONTROL_CONFIG, CONTROL_SERVICE,
+    DEFAULT_REPO, ETC_DIR, PM_LINK, SBRELAY_BIN, SINGBOX_BIN, SINGBOX_CONFIG, SINGBOX_SERVICE,
+    SINGBOX_SERVICE_NAME, TLS_CERT, TLS_KEY, VAR_DIR,
 };
 use crate::control::{router, ControlState};
 use crate::singbox::SingboxManager;
 use crate::store::Store;
 use crate::tls::{build_public_client, build_server_tls, cert_pin_from_file, generate_self_signed};
+use crate::TlsModeArg;
 
 pub async fn wait_shutdown_signal() {
     #[cfg(unix)]
@@ -45,21 +49,25 @@ pub async fn wait_shutdown_signal() {
 pub async fn run_control_cmd(config_path: &Path) -> Result<()> {
     let cfg = ControlConfig::load(config_path)?;
     let store = std::sync::Arc::new(Store::open(&cfg.data_dir)?);
-    let pin = cert_pin_from_file(&cfg.cert_file)?;
-    let tls_cfg = build_server_tls(&cfg.cert_file, &cfg.key_file)?;
     let addr: SocketAddr = cfg
         .listen
         .parse()
         .with_context(|| format!("监听地址不合法: {}", cfg.listen))?;
 
-    let bot = Bot::new(cfg.clone(), store.clone(), pin.clone())?;
+    let pin = if cfg.listen_tls {
+        Some(cert_pin_from_file(&cfg.cert_file)?)
+    } else {
+        None
+    };
+
+    let bot = Bot::new(cfg.clone(), config_path.to_path_buf(), store.clone(), pin.clone())?;
     let bot_hook = bot.clone();
     let ready_hook = std::sync::Arc::new(move |mid: String| {
         let b = bot_hook.clone();
         tokio::spawn(async move { b.notify_node_ready(&mid).await });
     });
 
-    let state = ControlState::new(store, Some(ready_hook));
+    let state = ControlState::new_with_proxy(store, Some(ready_hook), cfg.trust_proxy);
     let app = router(state);
 
     let (tx, rx) = watch::channel(false);
@@ -74,15 +82,34 @@ pub async fn run_control_cmd(config_path: &Path) -> Result<()> {
 
     let bot_task = tokio::spawn(bot.run_polling(rx));
 
-    info!(
-        "控制端启动成功 listen={} public_url={} tls_pin={}",
-        addr, cfg.public_url, pin
-    );
-    axum_server::bind_rustls(addr, tls_cfg)
-        .handle(handle)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .context("HTTPS 控制端服务异常退出")?;
+    if cfg.listen_tls {
+        let tls_cfg = build_server_tls(&cfg.cert_file, &cfg.key_file)?;
+        info!(
+            "控制端启动成功 (HTTPS) listen={} public_url={} tls_mode={} tls_pin={}",
+            addr,
+            cfg.public_url,
+            cfg.tls_mode,
+            pin.as_deref().unwrap_or("-")
+        );
+        axum_server::bind_rustls(addr, tls_cfg)
+            .handle(handle)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .context("HTTPS 控制端服务异常退出")?;
+    } else {
+        if !addr.ip().is_loopback() {
+            bail!("listen_tls = false 仅允许监听回环地址");
+        }
+        info!(
+            "控制端启动成功 (HTTP/反代后端) listen={} public_url={} tls_mode={}",
+            addr, cfg.public_url, cfg.tls_mode
+        );
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .context("HTTP 控制端服务异常退出")?;
+    }
 
     let _ = bot_task.await;
     Ok(())
@@ -95,87 +122,142 @@ pub fn require_root() -> Result<()> {
     Ok(())
 }
 
-pub async fn setup_control(
-    listen_arg: Option<String>,
-    public_url_arg: Option<String>,
-    regen_cert: bool,
-) -> Result<()> {
-    require_root()?;
-    println!("======== sbrelay 控制端安装 / 更新 ========");
+struct HttpsProbe {
+    webpki_ok: bool,
+    is_cloudflare: bool,
+    healthz_ok: bool,
+}
 
-    let existing = ControlConfig::load(Path::new(CONTROL_CONFIG)).ok();
+fn detect_local_proxy() -> Option<String> {
+    for svc in ["caddy", "nginx", "openresty", "traefik", "haproxy"] {
+        if systemctl_active(&format!("{svc}.service")) {
+            return Some(format!("{svc}.service"));
+        }
+    }
+    if TcpListener::bind("0.0.0.0:443")
+        .is_err_and(|e| e.kind() == io::ErrorKind::AddrInUse)
+    {
+        return Some("443 端口已被占用".to_string());
+    }
+    None
+}
 
-    let listen = normalize_listen(
-        &listen_arg
-            .or_else(|| std::env::var("SBRELAY_LISTEN").ok())
-            .or_else(|| existing.as_ref().map(|c| c.listen.clone()))
-            .unwrap_or_else(|| "0.0.0.0:8443".to_string()),
-    )?;
-    let port = listen
-        .rsplit_once(':')
-        .map(|(_, p)| p)
-        .unwrap_or("8443");
+async fn dns_matches_local_ip(host: &str, local_ip: Option<&str>) -> Option<bool> {
+    let local = local_ip?.parse::<IpAddr>().ok()?;
+    let addrs = tokio::net::lookup_host((host, 443)).await.ok()?;
+    let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
+    if ips.is_empty() {
+        return None;
+    }
+    Some(ips.contains(&local))
+}
 
-    let detected_ip = detect_public_ip().await;
-    let host_for_cert = detected_ip
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let default_pub = format!("https://{}:{port}", format_url_host(&host_for_cert));
-
-    let raw_pub = public_url_arg
-        .or_else(|| std::env::var("SBRELAY_PUBLIC_URL").ok())
-        .or_else(|| existing.as_ref().map(|c| c.public_url.clone()))
-        .unwrap_or(default_pub);
-    let public_url = validate_public_url(&raw_pub)?;
-
-    let tg_token = match std::env::var("SBRELAY_TG_TOKEN") {
-        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => match existing.as_ref().map(|c| c.tg_token.clone()) {
-            Some(old) if !old.is_empty() => {
-                println!("检测到已有 Bot token，已保留（如需更换请执行 sbrelay set-token）。");
-                old
+async fn probe_public_https(public_url: &str) -> HttpsProbe {
+    let Ok(cli) = build_public_client(Duration::from_secs(5)) else {
+        return HttpsProbe {
+            webpki_ok: false,
+            is_cloudflare: false,
+            healthz_ok: false,
+        };
+    };
+    let url = format!("{}/healthz", public_url.trim_end_matches('/'));
+    match cli.get(url).send().await {
+        Ok(resp) => {
+            let server_cf = resp
+                .headers()
+                .get("server")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|s| s.to_ascii_lowercase().contains("cloudflare"));
+            let is_cloudflare = server_cf || resp.headers().contains_key("cf-ray");
+            let status_ok = resp.status().is_success();
+            let body = resp.text().await.unwrap_or_default();
+            HttpsProbe {
+                webpki_ok: true,
+                is_cloudflare,
+                healthz_ok: status_ok && body.trim() == "ok",
             }
-            _ => prompt_secret("请输入 Telegram Bot token（不回显）：")?,
+        }
+        Err(_) => HttpsProbe {
+            webpki_ok: false,
+            is_cloudflare: false,
+            healthz_ok: false,
         },
-    };
-    validate_bot_token(&tg_token)?;
+    }
+}
 
-    let cert_path = PathBuf::from(TLS_CERT);
-    let key_path = PathBuf::from(TLS_KEY);
-    let pin = if regen_cert || !cert_path.exists() || !key_path.exists() {
-        println!("正在生成自签 TLS 证书（主机：{host_for_cert}）...");
-        generate_self_signed(&cert_path, &key_path, &host_for_cert)?
+fn ensure_url_port(url: &str, port: &str) -> Result<String> {
+    let mut parsed = url::Url::parse(url)?;
+    if parsed.port().is_none() {
+        let port_num: u16 = port.parse().context("端口不合法")?;
+        if port_num != 443 {
+            parsed
+                .set_port(Some(port_num))
+                .map_err(|_| anyhow!("设置端口失败"))?;
+        }
+    }
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn resolve_listen_with_tls(
+    listen_override: Option<&str>,
+    existing: Option<&ControlConfig>,
+    preferred_mode: TlsMode,
+    default_listen: &str,
+    plain_http: bool,
+) -> Result<(String, bool)> {
+    let raw = listen_override
+        .or_else(|| {
+            existing
+                .filter(|c| c.tls_mode == preferred_mode)
+                .map(|c| c.listen.as_str())
+        })
+        .unwrap_or(default_listen);
+    let listen = normalize_listen(raw)?;
+    let addr: SocketAddr = listen.parse()?;
+    let listen_tls = if preferred_mode == TlsMode::Webpki {
+        !plain_http && !addr.ip().is_loopback()
     } else {
-        println!("使用已有 TLS 证书，未覆盖。");
-        cert_pin_from_file(&cert_path)?
+        true
     };
+    Ok((listen, listen_tls))
+}
 
-    let owner_hint = std::env::var("SBRELAY_OWNER_ID")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .or_else(|| existing.as_ref().and_then(|c| c.owner_hint));
-    let repo = std::env::var("SBRELAY_REPO")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| existing.as_ref().map(|c| c.repo.clone()))
-        .unwrap_or_else(|| DEFAULT_REPO.to_string());
-
-    let cfg = ControlConfig {
-        tg_token,
-        listen: listen.clone(),
-        public_url: public_url.clone(),
-        data_dir: PathBuf::from(VAR_DIR),
-        cert_file: cert_path,
-        key_file: key_path,
-        owner_hint,
-        repo,
+fn print_reverse_proxy_snippets(public_url: &str, listen: &str, listen_tls: bool) {
+    let host = public_url_host(public_url).unwrap_or_else(|_| "ctl.example.com".into());
+    let upstream = if listen_tls {
+        format!("https://{listen}")
+    } else {
+        format!("http://{listen}")
     };
-    fs::create_dir_all(VAR_DIR)?;
-    fs::set_permissions(VAR_DIR, fs::Permissions::from_mode(0o700))?;
-    cfg.save(Path::new(CONTROL_CONFIG))?;
+    println!();
+    println!("请确保反代已将 {public_url} 转发到 {upstream}（以下配置二选一）：");
+    println!();
+    println!("  [Caddyfile 示例]");
+    println!("  {host} {{");
+    if listen_tls {
+        println!("      reverse_proxy {upstream} {{");
+        println!("          transport http {{");
+        println!("              tls_insecure_skip_verify");
+        println!("          }}");
+        println!("      }}");
+    } else {
+        println!("      reverse_proxy {upstream}");
+    }
+    println!("  }}");
+    println!();
+    println!("  [Nginx 示例（443 server 块内）]");
+    println!("  location / {{");
+    println!("      proxy_pass {upstream};");
+    println!("      proxy_http_version 1.1;");
+    println!("      proxy_set_header Host $host;");
+    println!("      proxy_set_header X-Real-IP $remote_addr;");
+    println!("      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;");
+    println!("      proxy_set_header X-Forwarded-Proto $scheme;");
+    println!("      proxy_read_timeout 60s;");
+    println!("  }}");
+}
 
-    ensure_pm_symlink();
-
+async fn write_and_start_control_service() -> Result<()> {
     let unit = format!(
         "[Unit]\n\
          Description=sbrelay Telegram control plane\n\
@@ -206,41 +288,303 @@ pub async fn setup_control(
     if !systemctl_active("sbrelay-control.service") {
         bail!("控制端服务启动失败，请排查: journalctl -u sbrelay-control -n 40");
     }
+    Ok(())
+}
+
+pub async fn setup_control(
+    listen_arg: Option<String>,
+    public_url_arg: Option<String>,
+    tls_mode_arg: TlsModeArg,
+    plain_http: bool,
+    regen_cert: bool,
+) -> Result<()> {
+    require_root()?;
+    println!("======== sbrelay 控制端安装 / 更新 ========");
+
+    let existing = ControlConfig::load(Path::new(CONTROL_CONFIG)).ok();
+    let listen_override = listen_arg
+        .or_else(|| std::env::var("SBRELAY_LISTEN").ok())
+        .filter(|s| !s.trim().is_empty());
+    let default_ip_port = listen_override
+        .as_deref()
+        .or_else(|| existing.as_ref().map(|c| c.listen.as_str()))
+        .and_then(|l| normalize_listen(l).ok())
+        .and_then(|l| l.rsplit_once(':').map(|(_, p)| p.to_string()))
+        .unwrap_or_else(|| "8443".to_string());
+
+    let detected_ip = detect_public_ip().await;
+    let fallback_ip_host = detected_ip.as_deref().unwrap_or("127.0.0.1");
+    let default_pub = existing
+        .as_ref()
+        .map(|c| c.public_url.clone())
+        .unwrap_or_else(|| format!("https://{}:{default_ip_port}", format_url_host(fallback_ip_host)));
+
+    let raw_pub = match public_url_arg
+        .or_else(|| std::env::var("SBRELAY_PUBLIC_URL").ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(v) => v,
+        None if is_tty() => {
+            let line = prompt_line(&format!(
+                "请输入控制端域名或公网地址（如 ctl.example.com，直接回车使用 {default_pub}）："
+            ))?;
+            if line.is_empty() {
+                default_pub
+            } else {
+                line
+            }
+        }
+        None => default_pub,
+    };
+
+    let (mut public_url, had_explicit_port) = parse_public_url_input(&raw_pub, &default_ip_port)?;
+    let host = public_url_host(&public_url)?;
+    let is_ip = is_ip_host(&host);
+
+    let (tls_mode, listen, listen_tls, trust_proxy) = if is_ip {
+        if tls_mode_arg == TlsModeArg::Webpki {
+            bail!("使用公信 CA 模式（--tls-mode webpki）时必须输入域名，不能使用裸 IP");
+        }
+        let (l, _) = resolve_listen_with_tls(
+            listen_override.as_deref(),
+            existing.as_ref(),
+            TlsMode::Pin,
+            "0.0.0.0:8443",
+            false,
+        )?;
+        (TlsMode::Pin, l, true, false)
+    } else {
+        match tls_mode_arg {
+            TlsModeArg::Pin => {
+                let (l, _) = resolve_listen_with_tls(
+                    listen_override.as_deref(),
+                    existing.as_ref(),
+                    TlsMode::Pin,
+                    "0.0.0.0:8443",
+                    false,
+                )?;
+                if !had_explicit_port {
+                    let lport = l.rsplit_once(':').map(|(_, p)| p).unwrap_or("8443");
+                    public_url = ensure_url_port(&public_url, lport)?;
+                }
+                (TlsMode::Pin, l, true, false)
+            }
+            TlsModeArg::Webpki => {
+                let (l, ltls) = resolve_listen_with_tls(
+                    listen_override.as_deref(),
+                    existing.as_ref(),
+                    TlsMode::Webpki,
+                    "127.0.0.1:8443",
+                    plain_http,
+                )?;
+                (TlsMode::Webpki, l, ltls, true)
+            }
+            TlsModeArg::Auto => {
+                println!("正在检测 {host} 的网络与反代环境...");
+                let local_proxy = detect_local_proxy();
+                let dns_local = dns_matches_local_ip(&host, detected_ip.as_deref()).await;
+                let probe = probe_public_https(&public_url).await;
+
+                if dns_local == Some(false) && !probe.is_cloudflare {
+                    println!(
+                        "提示：当前域名 {host} 解析 IP 与本机公网 IP 不一致（若尚未切换解析或刚改完 DNS 可忽略）。"
+                    );
+                }
+
+                if probe.is_cloudflare {
+                    println!("检测到 Cloudflare 代理，已自动启用公信 CA 模式（免 --pin）。");
+                    let def_listen = if local_proxy.is_some() && !had_explicit_port {
+                        "127.0.0.1:8443"
+                    } else {
+                        "0.0.0.0:8443"
+                    };
+                    let (l, ltls) = resolve_listen_with_tls(
+                        listen_override.as_deref(),
+                        existing.as_ref(),
+                        TlsMode::Webpki,
+                        def_listen,
+                        plain_http,
+                    )?;
+                    (TlsMode::Webpki, l, ltls, true)
+                } else if local_proxy.is_some() || probe.webpki_ok {
+                    if let Some(ref p) = local_proxy {
+                        println!(
+                            "检测到本机反代/443占用（{p}），已自动切换为公信 CA 反代模式（免 --pin）。"
+                        );
+                    } else {
+                        println!(
+                            "检测到 {public_url} 已提供有效公信 HTTPS，已自动启用公信 CA 模式（免 --pin）。"
+                        );
+                    }
+                    let (l, ltls) = resolve_listen_with_tls(
+                        listen_override.as_deref(),
+                        existing.as_ref(),
+                        TlsMode::Webpki,
+                        "127.0.0.1:8443",
+                        plain_http,
+                    )?;
+                    (TlsMode::Webpki, l, ltls, true)
+                } else if !had_explicit_port && is_tty() {
+                    println!("未检测到本机反代（Nginx/Caddy）或 Cloudflare 代理，请选择部署模式：");
+                    println!("  [1] 反代 + 公信 HTTPS（推荐，免 --pin、方便后续迁移）");
+                    println!("  [2] sbrelay 自签 HTTPS 直连（8443 端口 + 指纹固定）");
+                    let ans = prompt_line("请选择 [1/2]（默认 1）：")?;
+                    if ans.trim() == "2" {
+                        let (l, _) = resolve_listen_with_tls(
+                            listen_override.as_deref(),
+                            existing.as_ref(),
+                            TlsMode::Pin,
+                            "0.0.0.0:8443",
+                            false,
+                        )?;
+                        let lport = l.rsplit_once(':').map(|(_, p)| p).unwrap_or("8443");
+                        public_url = ensure_url_port(&public_url, lport)?;
+                        (TlsMode::Pin, l, true, false)
+                    } else {
+                        let (l, ltls) = resolve_listen_with_tls(
+                            listen_override.as_deref(),
+                            existing.as_ref(),
+                            TlsMode::Webpki,
+                            "127.0.0.1:8443",
+                            plain_http,
+                        )?;
+                        (TlsMode::Webpki, l, ltls, true)
+                    }
+                } else if had_explicit_port {
+                    let (l, _) = resolve_listen_with_tls(
+                        listen_override.as_deref(),
+                        existing.as_ref(),
+                        TlsMode::Pin,
+                        "0.0.0.0:8443",
+                        false,
+                    )?;
+                    (TlsMode::Pin, l, true, false)
+                } else {
+                    let (l, ltls) = resolve_listen_with_tls(
+                        listen_override.as_deref(),
+                        existing.as_ref(),
+                        TlsMode::Webpki,
+                        "127.0.0.1:8443",
+                        plain_http,
+                    )?;
+                    (TlsMode::Webpki, l, ltls, true)
+                }
+            }
+        }
+    };
+
+    let tg_token = match std::env::var("SBRELAY_TG_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => match existing.as_ref().map(|c| c.tg_token.clone()) {
+            Some(old) if !old.is_empty() => {
+                println!("检测到已有 Bot token，已保留（如需更换请执行 sbrelay set-token）。");
+                old
+            }
+            _ => prompt_secret("请输入 Telegram Bot token（不回显）：")?,
+        },
+    };
+    validate_bot_token(&tg_token)?;
+
+    let cert_path = PathBuf::from(TLS_CERT);
+    let key_path = PathBuf::from(TLS_KEY);
+    let pin = if listen_tls {
+        let p = if regen_cert || !cert_path.exists() || !key_path.exists() {
+            println!("正在生成自签 TLS 证书（主机：{host}）...");
+            generate_self_signed(&cert_path, &key_path, &host)?
+        } else {
+            println!("使用已有 TLS 证书，未覆盖。");
+            cert_pin_from_file(&cert_path)?
+        };
+        Some(p)
+    } else {
+        None
+    };
+
+    let owner_hint = std::env::var("SBRELAY_OWNER_ID")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| existing.as_ref().and_then(|c| c.owner_hint));
+    let repo = std::env::var("SBRELAY_REPO")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| existing.as_ref().map(|c| c.repo.clone()))
+        .unwrap_or_else(|| DEFAULT_REPO.to_string());
+
+    let mut cfg = ControlConfig {
+        tg_token,
+        listen: listen.clone(),
+        public_url: public_url.clone(),
+        tls_mode,
+        listen_tls,
+        trust_proxy,
+        data_dir: PathBuf::from(VAR_DIR),
+        cert_file: cert_path,
+        key_file: key_path,
+        owner_hint,
+        repo,
+    };
+    cfg.validate()?;
+    fs::create_dir_all(VAR_DIR)?;
+    fs::set_permissions(VAR_DIR, fs::Permissions::from_mode(0o700))?;
+    cfg.save(Path::new(CONTROL_CONFIG))?;
+
+    ensure_pm_symlink();
+    write_and_start_control_service().await?;
 
     println!();
     println!("控制端已就绪（active）");
     println!("版本：{}", env!("CARGO_PKG_VERSION"));
-    println!("监听：{listen}    对外地址：{public_url}");
-    println!("证书指纹（--pin）：{pin}");
+    println!("模式：{}    监听：{listen}    对外地址：{public_url}", tls_mode.cn());
+    if let (TlsMode::Pin, Some(p)) = (tls_mode, pin.as_deref()) {
+        println!("证书指纹（--pin）：{p}");
+    }
+    if tls_mode == TlsMode::Webpki {
+        let post_probe = probe_public_https(&public_url).await;
+        if post_probe.healthz_ok {
+            println!("公网反代连通检查通过（{public_url}/healthz -> ok）。");
+        } else {
+            print_reverse_proxy_snippets(&public_url, &listen, listen_tls);
+        }
+    }
     println!();
     println!("下一步：");
     println!("  1. 在 Telegram 向 Bot 发送 /start 绑定管理员。");
     println!("  2. 在面板点「添加线路机 / 添加落地机」，在目标机执行给出的一行命令。");
-    println!("  3. 随时运行 sbrelay menu（或 pm）打开管理菜单。");
+    println!("  3. 可在 Bot 发 /backup 导出加密备份，方便以后零重装迁移到新控制机。");
+    println!("  4. 随时运行 sbrelay menu（或 pm）打开管理菜单。");
     Ok(())
 }
 
 pub async fn setup_agent(
     url_arg: Option<String>,
     pin_arg: Option<String>,
+    clear_pin: bool,
     force_register: bool,
 ) -> Result<()> {
     require_root()?;
     println!("======== sbrelay Agent 安装 / 更新 ========");
 
     let existing = AgentConfig::load(Path::new(AGENT_CONFIG)).ok();
-    let url = validate_public_url(
-        &url_arg
-            .or_else(|| std::env::var("SBRELAY_URL").ok())
-            .or_else(|| existing.as_ref().map(|c| c.url.clone()))
-            .ok_or_else(|| anyhow!("缺少 --url（控制端地址）"))?,
-    )?;
-    let tls_pin = validate_pin(
-        &pin_arg
-            .or_else(|| std::env::var("SBRELAY_TLS_PIN").ok())
-            .or_else(|| existing.as_ref().map(|c| c.tls_pin.clone()))
-            .ok_or_else(|| anyhow!("缺少 --pin（控制端证书指纹）"))?,
-    )?;
+    let raw_url = url_arg
+        .or_else(|| std::env::var("SBRELAY_URL").ok())
+        .or_else(|| existing.as_ref().map(|c| c.url.clone()))
+        .ok_or_else(|| anyhow!("缺少 --url（控制端地址）"))?;
+    let (url, _) = parse_public_url_input(&raw_url, "8443")?;
+
+    let tls_pin = if clear_pin {
+        None
+    } else if let Some(p) = pin_arg
+        .or_else(|| std::env::var("SBRELAY_TLS_PIN").ok())
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(validate_pin(&p)?)
+    } else {
+        existing.as_ref().and_then(|c| c.tls_pin.clone())
+    };
+
+    if tls_pin.is_none() && is_ip_host(&public_url_host(&url)?) {
+        bail!("控制端地址为 IP 时必须提供证书指纹（--pin）");
+    }
 
     // 1. 先确保 sing-box 可用，避免环境失败白白消耗一次性令牌
     ensure_singbox_installed().await?;
@@ -264,7 +608,7 @@ pub async fn setup_agent(
             Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
             _ => prompt_secret("请输入面板提供的一次性安装令牌（不回显）：")?,
         };
-        let reg = register_with_token(&url, &tls_pin, &token).await?;
+        let reg = register_with_token(&url, tls_pin.as_deref(), &token).await?;
         println!("注册成功：{}（角色：{}）", reg.name, reg.role.cn());
         (reg.machine_id, reg.secret, reg.role)
     };
@@ -276,7 +620,7 @@ pub async fn setup_agent(
         .or(detect_public_ip().await);
 
     // 3. 立刻落盘 agent.toml，防止后续异常导致令牌浪费
-    let cfg = AgentConfig {
+    let mut cfg = AgentConfig {
         url,
         tls_pin,
         role,
@@ -288,6 +632,7 @@ pub async fn setup_agent(
         singbox_config: PathBuf::from(SINGBOX_CONFIG),
         service: SINGBOX_SERVICE_NAME.into(),
     };
+    cfg.validate()?;
     fs::create_dir_all(VAR_DIR)?;
     fs::set_permissions(VAR_DIR, fs::Permissions::from_mode(0o700))?;
     cfg.save(Path::new(AGENT_CONFIG))?;
@@ -532,8 +877,17 @@ pub fn show_status() {
         let st = svc_state_str("sbrelay-control.service");
         println!("控制端：{st}");
         if let Ok(cfg) = ControlConfig::load(Path::new(CONTROL_CONFIG)) {
-            println!("  监听：{}    对外：{}", cfg.listen, cfg.public_url);
-            if let Ok(pin) = cert_pin_from_file(&cfg.cert_file) {
+            println!(
+                "  模式：{}    监听：{}    对外：{}",
+                cfg.tls_mode.cn(),
+                cfg.listen,
+                cfg.public_url
+            );
+            if let Some(pin) = cfg
+                .listen_tls
+                .then(|| cert_pin_from_file(&cfg.cert_file).ok())
+                .flatten()
+            {
                 println!("  指纹（--pin）：{pin}");
             }
         }
@@ -544,7 +898,16 @@ pub fn show_status() {
     if Path::new(AGENT_SERVICE).exists() {
         let st = svc_state_str("sbrelay-agent.service");
         if let Ok(cfg) = AgentConfig::load(Path::new(AGENT_CONFIG)) {
-            println!("Agent ：{st}（角色：{}，控制端：{}）", cfg.role.cn(), cfg.url);
+            let verify = if cfg.tls_pin.is_some() {
+                "指纹固定"
+            } else {
+                "公信 CA"
+            };
+            println!(
+                "Agent ：{st}（角色：{}，校验：{verify}，控制端：{}）",
+                cfg.role.cn(),
+                cfg.url
+            );
         } else {
             println!("Agent ：{st}");
         }
@@ -556,6 +919,166 @@ pub fn show_status() {
         let svc_unit = format!("{SINGBOX_SERVICE_NAME}.service");
         println!("sing-box ({SINGBOX_SERVICE_NAME})：{}", svc_state_str(&svc_unit));
     }
+}
+
+pub fn backup_control(output: Option<PathBuf>, auto_pass: bool) -> Result<()> {
+    require_root()?;
+    let passphrase = match std::env::var("SBRELAY_BACKUP_PASS") {
+        Ok(p) if !p.is_empty() => p,
+        _ if auto_pass => {
+            let p = gen_backup_passphrase();
+            println!("已生成随机备份口令（请妥善保存）：{p}");
+            p
+        }
+        _ => {
+            let p1 = prompt_secret("请设置备份加密口令（不回显）：")?;
+            let p2 = prompt_secret("请再次输入确认口令（不回显）：")?;
+            if p1 != p2 {
+                bail!("两次输入的口令不一致");
+            }
+            p1
+        }
+    };
+
+    let bytes = create_backup(Path::new(CONTROL_CONFIG), None, &passphrase)?;
+    let out_path = output.unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "sbrelay-backup-{}.sbr",
+            Utc::now().format("%Y%m%d-%H%M%S")
+        ))
+    });
+    write_atomic(&out_path, &bytes, 0o600)?;
+    println!("控制端加密备份已生成：{}", out_path.display());
+    println!("迁移到新服务器后执行：sbrelay restore {}", out_path.display());
+    Ok(())
+}
+
+pub async fn restore_control(
+    file: &Path,
+    public_url_override: Option<String>,
+    listen_override: Option<String>,
+    tls_mode_override: Option<TlsModeArg>,
+) -> Result<()> {
+    require_root()?;
+    if !file.exists() {
+        bail!("找不到备份文件: {}", file.display());
+    }
+    let data =
+        fs::read(file).with_context(|| format!("读取备份文件失败: {}", file.display()))?;
+    let passphrase = match std::env::var("SBRELAY_BACKUP_PASS") {
+        Ok(p) if !p.is_empty() => p,
+        _ => prompt_secret("请输入备份解密口令（不回显）：")?,
+    };
+
+    let payload = decrypt_backup(&data, &passphrase)?;
+    let cfg_str =
+        std::str::from_utf8(&payload.control_toml).context("备份中 control.toml 不是有效 UTF-8")?;
+    let mut cfg = ControlConfig::from_toml_str(cfg_str)?;
+
+    if let Some(ref raw_url) = public_url_override {
+        let (u, _) = parse_public_url_input(raw_url, "8443")?;
+        cfg.public_url = u;
+    }
+    if let Some(ref raw_listen) = listen_override {
+        cfg.listen = normalize_listen(raw_listen)?;
+    }
+    if let Some(mode_arg) = tls_mode_override {
+        match mode_arg {
+            TlsModeArg::Pin => {
+                cfg.tls_mode = TlsMode::Pin;
+                cfg.listen_tls = true;
+                cfg.trust_proxy = false;
+            }
+            TlsModeArg::Webpki => {
+                cfg.tls_mode = TlsMode::Webpki;
+                cfg.trust_proxy = true;
+                if listen_override.is_none() && !cfg.listen.parse::<SocketAddr>()?.ip().is_loopback()
+                {
+                    cfg.listen = "127.0.0.1:8443".to_string();
+                }
+                cfg.listen_tls = !cfg.listen.parse::<SocketAddr>()?.ip().is_loopback();
+            }
+            TlsModeArg::Auto => {}
+        }
+    }
+    cfg.validate()?;
+
+    if systemctl_active("sbrelay-control.service") {
+        let _ = run_systemctl(&["stop", "sbrelay-control.service"]);
+    }
+
+    fs::create_dir_all(VAR_DIR)?;
+    fs::set_permissions(VAR_DIR, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir_all(&cfg.data_dir)?;
+    fs::set_permissions(&cfg.data_dir, fs::Permissions::from_mode(0o700))?;
+
+    cfg.save(Path::new(CONTROL_CONFIG))?;
+    if let Some(ref st) = payload.state_json {
+        write_atomic(&cfg.data_dir.join("state.json"), st, 0o600)?;
+    }
+    if let Some(ref crt) = payload.tls_crt {
+        write_atomic(&cfg.cert_file, crt, 0o644)?;
+    }
+    if let Some(ref key) = payload.tls_key {
+        write_atomic(&cfg.key_file, key, 0o600)?;
+    }
+    if cfg.listen_tls && (!cfg.cert_file.exists() || !cfg.key_file.exists()) {
+        let host = public_url_host(&cfg.public_url)?;
+        generate_self_signed(&cfg.cert_file, &cfg.key_file, &host)?;
+    }
+
+    ensure_pm_symlink();
+    write_and_start_control_service().await?;
+
+    let restored_count = payload.manifest.as_ref().map(|m| m.machine_count).unwrap_or(0);
+    println!();
+    println!("控制端已从备份恢复并启动（active）");
+    println!(
+        "模式：{}    监听：{}    对外地址：{}",
+        cfg.tls_mode.cn(),
+        cfg.listen,
+        cfg.public_url
+    );
+    println!("已恢复机器记录：{restored_count} 台");
+    if cfg.tls_mode == TlsMode::Webpki {
+        let post_probe = probe_public_https(&cfg.public_url).await;
+        if post_probe.healthz_ok {
+            println!("公网反代连通检查通过（{}/healthz -> ok）。", cfg.public_url);
+        } else {
+            print_reverse_proxy_snippets(&cfg.public_url, &cfg.listen, cfg.listen_tls);
+        }
+    }
+    println!();
+    println!("将域名解析或反代切到本机后，所有已安装的 Agent 会自动重连并上报节点状态，无需重新对接。");
+    Ok(())
+}
+
+pub fn rebind_agent(url: &str, pin: Option<String>, webpki: bool) -> Result<()> {
+    require_root()?;
+    let path = Path::new(AGENT_CONFIG);
+    let mut cfg = AgentConfig::load(path)?;
+    let (new_url, _) = parse_public_url_input(url, "8443")?;
+    cfg.url = new_url;
+    if webpki {
+        cfg.tls_pin = None;
+    } else if let Some(p) = pin.filter(|s| !s.trim().is_empty()) {
+        cfg.tls_pin = Some(validate_pin(&p)?);
+    }
+    cfg.validate()?;
+    cfg.save(path)?;
+    if Path::new(AGENT_SERVICE).exists() {
+        run_systemctl(&["restart", "sbrelay-agent.service"])?;
+    }
+    let verify = if cfg.tls_pin.is_some() {
+        "指纹固定"
+    } else {
+        "公信 CA"
+    };
+    println!(
+        "Agent 控制端地址已更新为 {}（校验：{verify}），现有节点与凭据保持不变。",
+        cfg.url
+    );
+    Ok(())
 }
 
 pub fn uninstall(purge: bool) -> Result<()> {
@@ -610,23 +1133,29 @@ pub async fn interactive_menu() -> Result<()> {
         println!();
         show_status();
         println!("----------------------------------------");
-        println!("  1. 安装 / 更新控制端");
+        println!("  1. 安装 / 更新控制端（支持域名与自动识别反代）");
         println!("  2. 安装 / 更新 Agent（线路机 / 落地机）");
         println!("  3. 修改 Bot token");
         println!("  4. 重启服务");
         println!("  5. 卸载（保留数据）");
         println!("  6. 彻底清除（删除数据）");
+        println!("  7. 备份控制端（生成加密 .sbr 文件）");
+        println!("  8. 从备份恢复控制端");
+        println!("  9. 灾备重绑 Agent 控制端地址");
         println!("  0. 退出");
         println!("----------------------------------------");
         let choice = prompt_line("请选择数字：")?;
         let res = match choice.trim() {
-            "1" => setup_control(None, None, false).await,
+            "1" => setup_control(None, None, TlsModeArg::Auto, false, false).await,
             "2" => {
-                let url = prompt_line("控制端地址（如 https://1.2.3.4:8443，留空复用已有）：")?;
-                let pin = prompt_line("证书指纹（64 位 hex，留空复用已有）：")?;
+                let url = prompt_line("控制端地址（如 https://ctl.example.com，留空复用已有）：")?;
+                let pin = prompt_line(
+                    "证书指纹（64 位 hex，反代/公信 CA 模式直接留空，已有配置留空复用）：",
+                )?;
                 setup_agent(
                     (!url.trim().is_empty()).then_some(url),
                     (!pin.trim().is_empty()).then_some(pin),
+                    false,
                     false,
                 )
                 .await
@@ -635,6 +1164,29 @@ pub async fn interactive_menu() -> Result<()> {
             "4" => restart_services(),
             "5" => uninstall(false),
             "6" => uninstall(true),
+            "7" => backup_control(None, false),
+            "8" => {
+                let file = prompt_line("请输入备份文件路径（.sbr）：")?;
+                if file.trim().is_empty() {
+                    Ok(())
+                } else {
+                    restore_control(Path::new(file.trim()), None, None, None).await
+                }
+            }
+            "9" => {
+                let url = prompt_line("请输入新控制端地址（域名或 https://IP:端口）：")?;
+                let pin = prompt_line("新证书指纹（公信 CA / 反代模式留空）：")?;
+                if url.trim().is_empty() {
+                    Ok(())
+                } else {
+                    let webpki = pin.trim().is_empty();
+                    rebind_agent(
+                        url.trim(),
+                        (!webpki).then_some(pin.trim().to_string()),
+                        webpki,
+                    )
+                }
+            }
             "0" | "" => break,
             _ => {
                 println!("无效选项。");
@@ -668,6 +1220,10 @@ async fn detect_public_ip() -> Option<String> {
         }
     }
     None
+}
+
+fn is_tty() -> bool {
+    unsafe { libc::isatty(0) != 0 }
 }
 
 fn ensure_pm_symlink() {

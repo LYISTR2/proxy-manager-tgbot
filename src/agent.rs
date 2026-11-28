@@ -16,6 +16,19 @@ use crate::protocol::{
 use crate::singbox::{EgressTarget, ServiceRunner, SingboxManager, SystemdRunner};
 use crate::tls::build_agent_client;
 
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = cur {
+        let s = e.to_string().trim().to_string();
+        if !s.is_empty() && parts.last() != Some(&s) {
+            parts.push(s);
+        }
+        cur = e.source();
+    }
+    redact(&parts.join(": "))
+}
+
 /// 使用一次性令牌向控制端注册（有指纹则强校验指纹，否则走公信 CA 校验）。
 pub async fn register_with_token(
     url: &str,
@@ -32,11 +45,12 @@ pub async fn register_with_token(
         .send()
         .await
         .map_err(|e| {
-            let msg = redact(&e.to_string());
+            let msg = format_error_chain(&e);
+            let lower = msg.to_ascii_lowercase();
             if tls_pin.is_none()
-                && (msg.contains("certificate")
+                && (lower.contains("certificate")
                     || msg.contains("UnknownIssuer")
-                    || msg.contains("tls"))
+                    || lower.contains("tls"))
             {
                 anyhow!("连接控制端失败: {msg}（若控制端使用自签证书直连，请传入 --pin <指纹>）")
             } else {
@@ -119,7 +133,7 @@ impl<R: ServiceRunner + 'static> AgentRunner<R> {
             .body(body)
             .send()
             .await
-            .map_err(|e| anyhow!("{}", redact(&e.to_string())))?;
+            .map_err(|e| anyhow!("{}", format_error_chain(&e)))?;
 
         let status = resp.status();
         let bytes = resp.bytes().await.unwrap_or_default();
@@ -329,5 +343,26 @@ mod tests {
         assert_eq!(st2.node.unwrap().password, "fixed-pass");
 
         handle.shutdown();
+    }
+
+    #[test]
+    fn error_chain_preserves_root_cause_and_redacts() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let err = Outer(std::io::Error::other("tls handshake failed password=topsecret"));
+        let msg = format_error_chain(&err);
+        assert!(msg.contains("error sending request"));
+        assert!(msg.contains("tls handshake failed"));
+        assert!(!msg.contains("topsecret"));
     }
 }

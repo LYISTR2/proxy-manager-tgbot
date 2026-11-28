@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
+use rand::Rng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tar::Archive;
@@ -123,7 +124,7 @@ pub fn require_root() -> Result<()> {
 }
 
 struct HttpsProbe {
-    webpki_ok: bool,
+    _webpki_ok: bool,
     is_cloudflare: bool,
     healthz_ok: bool,
 }
@@ -155,7 +156,7 @@ async fn dns_matches_local_ip(host: &str, local_ip: Option<&str>) -> Option<bool
 async fn probe_public_https(public_url: &str) -> HttpsProbe {
     let Ok(cli) = build_public_client(Duration::from_secs(5)) else {
         return HttpsProbe {
-            webpki_ok: false,
+            _webpki_ok: false,
             is_cloudflare: false,
             healthz_ok: false,
         };
@@ -172,30 +173,51 @@ async fn probe_public_https(public_url: &str) -> HttpsProbe {
             let status_ok = resp.status().is_success();
             let body = resp.text().await.unwrap_or_default();
             HttpsProbe {
-                webpki_ok: true,
+                _webpki_ok: true,
                 is_cloudflare,
                 healthz_ok: status_ok && body.trim() == "ok",
             }
         }
         Err(_) => HttpsProbe {
-            webpki_ok: false,
+            _webpki_ok: false,
             is_cloudflare: false,
             healthz_ok: false,
         },
     }
 }
 
-fn ensure_url_port(url: &str, port: &str) -> Result<String> {
-    let mut parsed = url::Url::parse(url)?;
-    if parsed.port().is_none() {
-        let port_num: u16 = port.parse().context("端口不合法")?;
-        if port_num != 443 {
-            parsed
-                .set_port(Some(port_num))
-                .map_err(|_| anyhow!("设置端口失败"))?;
+fn pick_free_tcp_port() -> u16 {
+    let mut rng = rand::thread_rng();
+    for _ in 0..64 {
+        let p: u16 = rng.gen_range(20000..=59999);
+        if TcpListener::bind(("0.0.0.0", p)).is_ok() {
+            return p;
         }
     }
+    rng.gen_range(20000..=59999)
+}
+
+fn parse_listen_port(listen: &str) -> &str {
+    listen.rsplit_once(':').map(|(_, p)| p).unwrap_or("8443")
+}
+
+fn set_url_port(url: &str, port: &str) -> Result<String> {
+    let mut parsed = url::Url::parse(url)?;
+    let port_num: u16 = port.parse().context("端口不合法")?;
+    let target = if port_num == 443 { None } else { Some(port_num) };
+    parsed
+        .set_port(target)
+        .map_err(|_| anyhow!("设置端口失败"))?;
     Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn print_cf_origin_rules_hint(public_url: &str, listen_port: &str) {
+    let host = public_url_host(public_url).unwrap_or_else(|_| "pm.example.com".into());
+    println!();
+    println!("Cloudflare 橙云回源设置提示：");
+    println!("  1. SSL/TLS → 概述：选择「完全（Full）」（不要选 Full Strict）");
+    println!("  2. 规则 → Origin Rules：主机名等于 {host} → 目标端口重写为 {listen_port}");
+    println!("  3. 服务器防火墙放行 TCP {listen_port}");
 }
 
 fn resolve_listen_with_tls(
@@ -302,22 +324,45 @@ pub async fn setup_control(
     println!("======== sbrelay 控制端安装 / 更新 ========");
 
     let existing = ControlConfig::load(Path::new(CONTROL_CONFIG)).ok();
-    let listen_override = listen_arg
+    let mut listen_override = listen_arg
         .or_else(|| std::env::var("SBRELAY_LISTEN").ok())
         .filter(|s| !s.trim().is_empty());
-    let default_ip_port = listen_override
+
+    let default_port = listen_override
         .as_deref()
-        .or_else(|| existing.as_ref().map(|c| c.listen.as_str()))
         .and_then(|l| normalize_listen(l).ok())
-        .and_then(|l| l.rsplit_once(':').map(|(_, p)| p.to_string()))
-        .unwrap_or_else(|| "8443".to_string());
+        .map(|l| parse_listen_port(&l).to_string())
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|c| parse_listen_port(&c.listen).to_string())
+        })
+        .unwrap_or_else(|| pick_free_tcp_port().to_string());
+
+    if listen_override.is_none() && is_tty() {
+        let port_line = prompt_line(&format!(
+            "请输入控制端高位监听端口（推荐 20000–59999，直接回车使用 {default_port}）："
+        ))?;
+        if !port_line.is_empty() {
+            listen_override = Some(normalize_listen(&port_line)?);
+        }
+    }
+
+    let chosen_port = listen_override
+        .as_deref()
+        .and_then(|l| normalize_listen(l).ok())
+        .map(|l| parse_listen_port(&l).to_string())
+        .unwrap_or_else(|| default_port.clone());
+
+    let default_listen_pin = format!("0.0.0.0:{chosen_port}");
+    let default_listen_webpki = format!("127.0.0.1:{chosen_port}");
 
     let detected_ip = detect_public_ip().await;
     let fallback_ip_host = detected_ip.as_deref().unwrap_or("127.0.0.1");
     let default_pub = existing
         .as_ref()
         .map(|c| c.public_url.clone())
-        .unwrap_or_else(|| format!("https://{}:{default_ip_port}", format_url_host(fallback_ip_host)));
+        .unwrap_or_else(|| format!("https://{}:{chosen_port}", format_url_host(fallback_ip_host)));
 
     let raw_pub = match public_url_arg
         .or_else(|| std::env::var("SBRELAY_PUBLIC_URL").ok())
@@ -326,7 +371,7 @@ pub async fn setup_control(
         Some(v) => v,
         None if is_tty() => {
             let line = prompt_line(&format!(
-                "请输入控制端域名或公网地址（如 ctl.example.com，直接回车使用 {default_pub}）："
+                "请输入控制端域名或公网地址（如 pm.example.com，推荐仅 DNS 灰云直连；直接回车使用 {default_pub}）："
             ))?;
             if line.is_empty() {
                 default_pub
@@ -337,7 +382,7 @@ pub async fn setup_control(
         None => default_pub,
     };
 
-    let (mut public_url, had_explicit_port) = parse_public_url_input(&raw_pub, &default_ip_port)?;
+    let (mut public_url, had_explicit_port) = parse_public_url_input(&raw_pub, &chosen_port)?;
     let host = public_url_host(&public_url)?;
     let is_ip = is_ip_host(&host);
 
@@ -349,9 +394,12 @@ pub async fn setup_control(
             listen_override.as_deref(),
             existing.as_ref(),
             TlsMode::Pin,
-            "0.0.0.0:8443",
+            &default_listen_pin,
             false,
         )?;
+        if !had_explicit_port {
+            public_url = set_url_port(&public_url, parse_listen_port(&l))?;
+        }
         (TlsMode::Pin, l, true, false)
     } else {
         match tls_mode_arg {
@@ -360,12 +408,11 @@ pub async fn setup_control(
                     listen_override.as_deref(),
                     existing.as_ref(),
                     TlsMode::Pin,
-                    "0.0.0.0:8443",
+                    &default_listen_pin,
                     false,
                 )?;
                 if !had_explicit_port {
-                    let lport = l.rsplit_once(':').map(|(_, p)| p).unwrap_or("8443");
-                    public_url = ensure_url_port(&public_url, lport)?;
+                    public_url = set_url_port(&public_url, parse_listen_port(&l))?;
                 }
                 (TlsMode::Pin, l, true, false)
             }
@@ -374,100 +421,98 @@ pub async fn setup_control(
                     listen_override.as_deref(),
                     existing.as_ref(),
                     TlsMode::Webpki,
-                    "127.0.0.1:8443",
+                    &default_listen_webpki,
                     plain_http,
                 )?;
                 (TlsMode::Webpki, l, ltls, true)
             }
             TlsModeArg::Auto => {
-                println!("正在检测 {host} 的网络与反代环境...");
-                let local_proxy = detect_local_proxy();
-                let dns_local = dns_matches_local_ip(&host, detected_ip.as_deref()).await;
-                let probe = probe_public_https(&public_url).await;
-
-                if dns_local == Some(false) && !probe.is_cloudflare {
-                    println!(
-                        "提示：当前域名 {host} 解析 IP 与本机公网 IP 不一致（若尚未切换解析或刚改完 DNS 可忽略）。"
-                    );
-                }
-
-                if probe.is_cloudflare {
-                    println!("检测到 Cloudflare 代理，已自动启用公信 CA 模式（免 --pin）。");
-                    let def_listen = if local_proxy.is_some() && !had_explicit_port {
-                        "127.0.0.1:8443"
-                    } else {
-                        "0.0.0.0:8443"
-                    };
+                if plain_http {
                     let (l, ltls) = resolve_listen_with_tls(
                         listen_override.as_deref(),
                         existing.as_ref(),
                         TlsMode::Webpki,
-                        def_listen,
-                        plain_http,
+                        &default_listen_webpki,
+                        true,
                     )?;
                     (TlsMode::Webpki, l, ltls, true)
-                } else if local_proxy.is_some() || probe.webpki_ok {
-                    if let Some(ref p) = local_proxy {
+                } else {
+                    println!("正在检测 {host} 的网络环境...");
+                    let local_proxy = detect_local_proxy();
+                    let dns_local = dns_matches_local_ip(&host, detected_ip.as_deref()).await;
+                    let probe = probe_public_https(&public_url).await;
+
+                    if dns_local == Some(false) && !probe.is_cloudflare {
                         println!(
-                            "检测到本机反代/443占用（{p}），已自动切换为公信 CA 反代模式（免 --pin）。"
-                        );
-                    } else {
-                        println!(
-                            "检测到 {public_url} 已提供有效公信 HTTPS，已自动启用公信 CA 模式（免 --pin）。"
+                            "提示：当前域名 {host} 解析 IP 与本机公网 IP 不一致（若尚未切换解析或刚改完 DNS 可忽略）。"
                         );
                     }
-                    let (l, ltls) = resolve_listen_with_tls(
-                        listen_override.as_deref(),
-                        existing.as_ref(),
-                        TlsMode::Webpki,
-                        "127.0.0.1:8443",
-                        plain_http,
-                    )?;
-                    (TlsMode::Webpki, l, ltls, true)
-                } else if !had_explicit_port && is_tty() {
-                    println!("未检测到本机反代（Nginx/Caddy）或 Cloudflare 代理，请选择部署模式：");
-                    println!("  [1] 反代 + 公信 HTTPS（推荐，免 --pin、方便后续迁移）");
-                    println!("  [2] sbrelay 自签 HTTPS 直连（8443 端口 + 指纹固定）");
-                    let ans = prompt_line("请选择 [1/2]（默认 1）：")?;
-                    if ans.trim() == "2" {
+
+                    if probe.is_cloudflare && !had_explicit_port && is_tty() {
+                        println!("检测到 {host} 当前开启了 Cloudflare 代理（橙云），请选择接入方式：");
+                        println!("  [1] 域名高位端口直连（默认推荐：请将 CF 改为「仅 DNS 灰云」，零反代、指纹固定、备份恢复即可迁移）");
+                        println!("  [2] 保持 Cloudflare 橙云（公信 CA 免 --pin，需在 CF Origin Rules 将 443 回源到 {chosen_port} 且 SSL 设为 Full）");
+                        let ans = prompt_line("请选择 [1/2]（默认 1）：")?;
+                        if ans.trim() == "2" {
+                            let (l, ltls) = resolve_listen_with_tls(
+                                listen_override.as_deref(),
+                                existing.as_ref(),
+                                TlsMode::Webpki,
+                                &default_listen_pin,
+                                false,
+                            )?;
+                            (TlsMode::Webpki, l, ltls, true)
+                        } else {
+                            let (l, _) = resolve_listen_with_tls(
+                                listen_override.as_deref(),
+                                existing.as_ref(),
+                                TlsMode::Pin,
+                                &default_listen_pin,
+                                false,
+                            )?;
+                            public_url = set_url_port(&public_url, parse_listen_port(&l))?;
+                            (TlsMode::Pin, l, true, false)
+                        }
+                    } else if local_proxy.is_some() && !had_explicit_port && is_tty() {
+                        let p = local_proxy.as_deref().unwrap_or("443");
+                        println!("检测到本机存在反代/443占用（{p}），请选择接入方式：");
+                        println!("  [1] 域名高位端口直连（默认推荐：监听 {chosen_port}，不碰本机反代，自签指纹固定）");
+                        println!("  [2] 接入本机反代（公信 CA 免 --pin，监听 127.0.0.1:{chosen_port}）");
+                        let ans = prompt_line("请选择 [1/2]（默认 1）：")?;
+                        if ans.trim() == "2" {
+                            let (l, ltls) = resolve_listen_with_tls(
+                                listen_override.as_deref(),
+                                existing.as_ref(),
+                                TlsMode::Webpki,
+                                &default_listen_webpki,
+                                false,
+                            )?;
+                            (TlsMode::Webpki, l, ltls, true)
+                        } else {
+                            let (l, _) = resolve_listen_with_tls(
+                                listen_override.as_deref(),
+                                existing.as_ref(),
+                                TlsMode::Pin,
+                                &default_listen_pin,
+                                false,
+                            )?;
+                            public_url = set_url_port(&public_url, parse_listen_port(&l))?;
+                            (TlsMode::Pin, l, true, false)
+                        }
+                    } else {
+                        // 默认方案二：域名 + 高位端口直连（TLS 指纹固定，零反代依赖）
                         let (l, _) = resolve_listen_with_tls(
                             listen_override.as_deref(),
                             existing.as_ref(),
                             TlsMode::Pin,
-                            "0.0.0.0:8443",
+                            &default_listen_pin,
                             false,
                         )?;
-                        let lport = l.rsplit_once(':').map(|(_, p)| p).unwrap_or("8443");
-                        public_url = ensure_url_port(&public_url, lport)?;
+                        if !had_explicit_port {
+                            public_url = set_url_port(&public_url, parse_listen_port(&l))?;
+                        }
                         (TlsMode::Pin, l, true, false)
-                    } else {
-                        let (l, ltls) = resolve_listen_with_tls(
-                            listen_override.as_deref(),
-                            existing.as_ref(),
-                            TlsMode::Webpki,
-                            "127.0.0.1:8443",
-                            plain_http,
-                        )?;
-                        (TlsMode::Webpki, l, ltls, true)
                     }
-                } else if had_explicit_port {
-                    let (l, _) = resolve_listen_with_tls(
-                        listen_override.as_deref(),
-                        existing.as_ref(),
-                        TlsMode::Pin,
-                        "0.0.0.0:8443",
-                        false,
-                    )?;
-                    (TlsMode::Pin, l, true, false)
-                } else {
-                    let (l, ltls) = resolve_listen_with_tls(
-                        listen_override.as_deref(),
-                        existing.as_ref(),
-                        TlsMode::Webpki,
-                        "127.0.0.1:8443",
-                        plain_http,
-                    )?;
-                    (TlsMode::Webpki, l, ltls, true)
                 }
             }
         }
@@ -537,11 +582,15 @@ pub async fn setup_control(
     println!("模式：{}    监听：{listen}    对外地址：{public_url}", tls_mode.cn());
     if let (TlsMode::Pin, Some(p)) = (tls_mode, pin.as_deref()) {
         println!("证书指纹（--pin）：{p}");
+        let lport = parse_listen_port(&listen);
+        println!("请确保服务器防火墙已放行 TCP {lport}；若使用 Cloudflare 域名，请设为「仅 DNS（灰云）」。");
     }
     if tls_mode == TlsMode::Webpki {
         let post_probe = probe_public_https(&public_url).await;
         if post_probe.healthz_ok {
             println!("公网反代连通检查通过（{public_url}/healthz -> ok）。");
+        } else if listen_tls {
+            print_cf_origin_rules_hint(&public_url, parse_listen_port(&listen));
         } else {
             print_reverse_proxy_snippets(&public_url, &listen, listen_tls);
         }
@@ -1317,5 +1366,18 @@ mod tests {
         assert_eq!(normalize_listen("8443").unwrap(), "0.0.0.0:8443");
         assert_eq!(normalize_listen("127.0.0.1:9443").unwrap(), "127.0.0.1:9443");
         assert!(normalize_listen("not-an-addr").is_err());
+    }
+
+    #[test]
+    fn port_helpers_work() {
+        assert_eq!(parse_listen_port("0.0.0.0:38443"), "38443");
+        assert_eq!(
+            set_url_port("https://pm.example.com", "38443").unwrap(),
+            "https://pm.example.com:38443"
+        );
+        assert_eq!(
+            set_url_port("https://pm.example.com:38443", "443").unwrap(),
+            "https://pm.example.com"
+        );
     }
 }

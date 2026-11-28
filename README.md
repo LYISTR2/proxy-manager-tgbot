@@ -22,26 +22,25 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LYISTR2/proxy-manager-tgbot/
 
 1. 在 [@BotFather](https://t.me/BotFather) 创建 Bot，获取 token。
 2. 在控制端机器运行上方安装命令：
-   - 交互提示可直接输入**域名**（如 `ctl.example.com`，自动补全 `https://`），或留空直接用检测到的公网 IP。
-   - 会自动识别本机 `Nginx / Caddy / 443` 反代或 `Cloudflare` 代理：识别到后自动切换为**公信 CA 模式**（仅监听 `127.0.0.1:8443`，免 `--pin`），并打印可直接复制的反代配置片段。
+   - **高位随机端口 + 域名直连（默认推荐）**：交互提示可直接输入高位端口（默认随机 `20000–59999`，避开常规 8443）和域名（如 `pm.example.com`，Cloudflare 建议设为「仅 DNS 灰云」），无需安装 Nginx/Caddy，自签证书指纹固定，迁移时证书与状态一起带走。
+   - **可选反代 / CF 橙云模式**：如已有本机 Caddy/Nginx 或希望走 Cloudflare 橙云回源，可在安装提示中选择或传入 `--tls-mode webpki`。
 3. 完成后在 Telegram 给 Bot 发 `/start`（首位发送者成为管理员）。
 4. 在 Bot 面板点「添加线路机 / 添加落地机」，把生成的一行命令复制到目标机器以 root 执行：
    - 没装 `sing-box` 会自动下载官方稳定版（校验 SHA-256）。
    - 自动生成 SS2022 入站（`2022-blake3-aes-128-gcm`）并上报；线路机会自动把节点链接推送到 Telegram。
-   - 若控制端为域名反代模式，生成的命令自动省去 `--pin`，换新证书或迁移控制端都不会影响已有节点。
 5. 在线路机面板点「换落地 / 本机直出」→ 选择目标落地机或「本机直出」→ 确认即可。
 
 ## 控制端迁移（无需重新对接 Agent）
 
-只要控制端使用了**域名（反代 / CF 模式）**，换新服务器时 Agent 一台都不用碰：
+只要控制端绑定了**域名**（无论高位端口直连还是反代模式），换新服务器时 Agent 一台都不用碰：
 
-1. 在旧控制端（或直接在 Telegram Bot 发 `/backup` / 点「备份控制端」）导出加密备份 `.sbr` 文件并记下口令。
-2. 在新服务器安装 `sbrelay` 后执行：
+1. 在旧控制端（或直接在 Telegram Bot 发 `/backup` / 点「备份控制端」）导出加密备份 `.sbr` 文件并记下口令（备份内含 `control.toml`、`state.json` 及自签 `tls.crt`/`tls.key`）。
+2. 在新服务器安装 `sbrelay` 后放行对应端口并执行：
    ```bash
    sbrelay restore sbrelay-backup-xxxx.sbr
    ```
-3. 把域名解析（DNS）和反代切到新服务器。
-4. 所有已安装 Agent 的线路机 / 落地机每 5 秒自动重连域名，**自动通过原有 HMAC 凭据认证并重新上报节点信息与当前出口**。
+3. 把域名解析（DNS）切到新服务器 IP。
+4. 所有已安装 Agent 的线路机 / 落地机每 5 秒自动重连域名，**TLS 证书指纹与原有 HMAC 凭据完全一致，会自动无感上线并重新上报节点信息与当前出口**。
 
 > 如果当初用 IP 直连（无域名）且旧机已失联，在新机 `restore` 后，只需在目标机跑一行 `sbrelay rebind --url https://新地址:8443`（无需重新生成令牌，不动已有 SS2022 节点）。
 
